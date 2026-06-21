@@ -1,0 +1,37 @@
+# Docker Compose configuration for integration testing
+
+version: "3.8"
+
+services:
+  app:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    ports:
+      - "9090:9090"
+    environment:
+      - PORT=9090
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - -f
+        - http://localhost:9090/health
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  tests:
+    image: python:3.12-slim
+    depends_on:
+      app:
+        condition: service_healthy
+    working_dir: /app/tests
+    volumes:
+      - ../..:/app
+    environment:
+      - PYTHONPATH=/app
+    command: >
+      sh -c "pip install pytest httpx pytest-asyncio &&
+             pytest integration/ -v --tb=short"
