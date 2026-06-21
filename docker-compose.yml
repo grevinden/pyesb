@@ -9,6 +9,7 @@ services:
       dockerfile: Dockerfile
     ports:
       - "9090:9090"
+      - "6698:6698"
     environment:
       - PORT=9090
       - LOG_LEVEL=debug

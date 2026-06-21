@@ -24,6 +24,8 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         ca-certificates \
         libssl3 \
+        libsasl2-2 \
+        libsasl2-modules \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user for security
@@ -49,6 +51,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:${PORT}/health || exit 1
 
 EXPOSE ${PORT}
+EXPOSE 6698
 
 # Use uv to run the application with proper signal handling
 ENTRYPOINT ["uv", "run", "fastapi"]
