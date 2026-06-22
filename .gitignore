@@ -1,25 +1,12 @@
-# Python
+!/app/
+
+!/.gitignore
+!/.dockerignore
+!/.python-version
+
+!/pyproject.toml
+!/compose.yaml
+!/Dockerfile
+!/uv.lock
 __pycache__/
-*.py[cod]
-*.so
-.Python
-lib/
-
-# Virtual environment
-.venv/
-
-# Build
-build/
-dist/
-*.egg-info/
-
-# Keys (generated at runtime)
-keys/
-
-# IDE
-.vscode/
-.idea/
-
-# OS
-.DS_Store
-Thumbs.db
+*
