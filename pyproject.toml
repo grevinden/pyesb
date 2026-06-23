@@ -1,15 +1,12 @@
 [project]
 name = "pyesb"
-version = "0.1.0"
+dynamic = ["version"]
 description = "1C ESB Gateway compatible server"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.13"
 dependencies = [
     "fastapi[standard-no-fastapi-cloud-cli]>=0.115.0",
-    "uvicorn>=0.34.0",
-    "pyjwt[crypto]>=2.10.0",
-    "pydantic-settings>=2.0.0",
-    "python-qpid-proton>=0.40.0",
+    "pyesb-amqp",
 ]
 
 [project.optional-dependencies]
@@ -26,3 +23,6 @@ testpaths = ["tests"]
 dev = [
     "icecream>=2.2.0",
 ]
+
+[tool.uv.sources]
+pyesb-amqp = { git = "https://github.com/grevinden/pyesb-amqp.git" }
