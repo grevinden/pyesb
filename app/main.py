@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from pyesb_amqp import AmqpMessage, AmqpServer
+from pyesb_amqp.models import E1CMessage
 from pyesb_amqp.oidc import router as oidc_router
 
 
@@ -11,8 +12,16 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[dict, None]:
     """Start and stop the AMQP server alongside FastAPI."""
 
     async def amqp_handler(msg: AmqpMessage) -> bool:
-        print(msg)
-        return True
+        try:
+            print(
+                E1CMessage.model_validate(msg, from_attributes=True).model_dump_json(
+                    indent=2
+                )
+            )
+            return True
+        except Exception as exc:
+            print(exc)
+            return False
 
     async with AmqpServer(handler=amqp_handler):
         yield {}
