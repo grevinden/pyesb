@@ -11,8 +11,9 @@ from pyesb_amqp.oidc import router as oidc_router
 async def lifespan(_app: FastAPI) -> AsyncGenerator[dict, None]:
     """Start and stop the AMQP server alongside FastAPI."""
 
-    async def amqp_handler(msg: AmqpMessage) -> bool:
+    async def amqp_handler(channel: str, msg: AmqpMessage) -> bool:
         try:
+            print(f"[channel={channel}]")
             print(
                 E1CMessage.model_validate(msg, from_attributes=True).model_dump_json(
                     indent=2
