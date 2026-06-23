@@ -483,7 +483,7 @@ dev = [{ name = "icecream", specifier = ">=2.2.0" }]
 [[package]]
 name = "pyesb-amqp"
 version = "0.0.0"
-source = { git = "https://github.com/grevinden/pyesb-amqp.git#cb4fd703629ebaa7a0b5ae9f9842e5451d1146a0" }
+source = { git = "https://github.com/grevinden/pyesb-amqp.git#c68bb7c7bdb6b937d4a18e52883c5fad44bb6c61" }
 dependencies = [
     { name = "fastapi" },
     { name = "pydantic" },
