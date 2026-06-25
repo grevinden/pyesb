@@ -1,5 +1,6 @@
 [project]
 name = "pyesb"
+
 dynamic = ["version"]
 description = "1C ESB Gateway compatible server"
 readme = "README.md"
@@ -7,7 +8,17 @@ requires-python = ">=3.13"
 dependencies = [
     "fastapi[standard-no-fastapi-cloud-cli]>=0.115.0",
     "pyesb-amqp",
+    "sqlmodel>=0.0.22",
+    "aiosqlite>=0.20.0",
+    "sqlalchemy[asyncio]>=2.0",
+    "dill>=0.3.9",
+    "structlog>=25.1.0",
+    "pyyaml>=6.0.1",
 ]
+
+[tool.uv]
+package = false
+
 
 [project.optional-dependencies]
 test = [
@@ -21,6 +32,7 @@ include = ["app*"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+pythonpath = ["."]
 
 [dependency-groups]
 dev = [
