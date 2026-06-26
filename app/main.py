@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 from contextlib import AsyncExitStack, asynccontextmanager
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from apscheduler import AsyncScheduler, TaskDefaults
 from apscheduler.datastores.sqlalchemy import SQLAlchemyDataStore
@@ -19,7 +19,26 @@ from pyesb_amqp.oidc import ChannelDesription
 from pyesb_amqp.oidc import add_routes as oidc_add_routes
 
 from .database import close_db, get_engine
-from .log import get_logger, load_logging_config, stderr_redirect_lifespan
+from .events import (
+    HandlerFailedEvent,
+    PayloadReceivedAMQPEvent,
+    PayloadReceivedEvent,
+    SchedulerStartedEvent,
+    ServiceStartupEvent,
+    ShutdownAmqpStoppedEvent,
+    ShutdownCompleteEvent,
+    ShutdownDeliveriesResolvedEvent,
+    fmt_headers,
+)
+from .log import (
+    load_logging_config,
+    start_logging_queue,
+    stderr_redirect_lifespan,
+    stop_logging_queue,
+)
+
+# Константы для поиска trace_id в заголовках сообщения
+_TRACE_ID_HEADER = "X-Trace-Id"
 
 # ---------------------------------------------------------------------------
 # Архитектура приёма сообщений
@@ -48,6 +67,7 @@ class PayloadSchema(BaseModel):
     timeout: PositiveInt
     pause: PositiveInt
     ttl: PositiveInt
+    trace_id: UUID | None = None
 
 
 class Message(E1CMessage):
@@ -73,12 +93,11 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     5. ``close_db()``.
     """
     load_logging_config()
-    logger = get_logger("lifespan")
-    logger.info("service_startup")
+    start_logging_queue()  # неблокирующее логирование через QueueHandler
+    ServiceStartupEvent().emit()
 
     from .delivery import create_delivery_schedule
 
-    # Guard — захватывает logger из замыкания
     @asynccontextmanager
     async def _shutdown_guard() -> AsyncGenerator[None, None]:
         from .delivery import _shutting_down, wait_for_in_flight
@@ -87,9 +106,9 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
             yield
         finally:
             _shutting_down = True
-            logger.info("shutdown: amqp_stopped")
+            ShutdownAmqpStoppedEvent().emit()
             await wait_for_in_flight(timeout=30)
-            logger.info("shutdown: deliveries_resolved")
+            ShutdownDeliveriesResolvedEvent().emit()
 
     async with AsyncExitStack() as exit_stack:
         # ── 1. Scheduler (exits LAST) ─────────────────────────────────
@@ -100,7 +119,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
         )
         await exit_stack.enter_async_context(scheduler)
         await scheduler.start_in_background()
-        logger.info("scheduler_started", max_concurrent=20)
+        SchedulerStartedEvent(max_concurrent=20).emit()
 
         # ── 2. Shutdown guard (exits BETWEEN AMQP and Scheduler) ──────
         await exit_stack.enter_async_context(_shutdown_guard())
@@ -119,9 +138,13 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
                     if parsed.properties.correlation_id
                     else None
                 )
-                sender_code = parsed.application_properties.integ_sender_code
-                recipient_code = parsed.application_properties.integ_recipient_code
-                integ_message_id = str(parsed.application_properties.integ_message_id)
+                _props = parsed.application_properties
+                sender_code = _first_str(_props.integ_sender_code)
+                recipient_code = _first_str(_props.integ_recipient_code)
+                integ_message_id = str(_props.integ_message_id)
+
+                # ── trace_id: из тела сообщения, либо из заголовка X-Trace-Id ──
+                trace_id = _resolve_trace_id(ps.trace_id, ps.headers)
 
                 schedule_id = await create_delivery_schedule(
                     scheduler,
@@ -132,11 +155,11 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
                     timeout=ps.timeout,
                     pause=ps.pause,
                     ttl=ps.ttl,
+                    trace_id=trace_id,
                     message_id=message_id,
                 )
 
-                logger.info(
-                    "payload_received",
+                PayloadReceivedAMQPEvent(
                     message_id=message_id,
                     correlation_id=correlation_id,
                     sender_code=sender_code,
@@ -144,19 +167,19 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
                     integ_message_id=integ_message_id,
                     destination=destination,
                     url=str(ps.url),
-                    headers=([list(h) for h in ps.headers] if ps.headers else None),
+                    headers=fmt_headers(ps.headers),
                     timeout=ps.timeout,
                     pause=ps.pause,
                     ttl=ps.ttl,
+                    trace_id=trace_id,
                     schedule_id=schedule_id,
-                )
+                ).emit()
                 return True
             except Exception as e:
-                logger.error(
-                    "handler_failed",
+                HandlerFailedEvent(
                     destination=destination,
                     error=f"{type(e).__name__}: {e}",
-                )
+                ).emit()
                 return False
 
         # ── 4. AMQP + stderr (exit FIRST) ─────────────────────────────
@@ -172,7 +195,49 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
 
     # ── После выхода из стека: scheduler остановлен ────────────────────
     await close_db()
-    logger.info("shutdown: complete")
+    ShutdownCompleteEvent().emit()
+    stop_logging_queue()  # flush всех оставшихся записей
+
+
+def _first_str(val: str | list[str] | None) -> str | None:
+    """Извлечь первую строку из значения, которое может быть str, list[str] или None.
+
+    AMQP application properties из pyesb_amqp иногда приходят как ``list[str]``
+    (напр. ``integ_sender_code``, ``integ_recipient_code``).
+    """
+    if val is None:
+        return None
+    if isinstance(val, list):
+        return val[0] if val else None
+    return val
+
+
+def _resolve_trace_id(
+    trace_id: UUID | None,
+    headers: set[tuple[str, str]] | None,
+) -> str | None:
+    """Получить trace_id из тела сообщения (приоритет) или из заголовка X-Trace-Id.
+
+    Если ``trace_id`` передан в теле (``PayloadSchema.trace_id``) — используем его.
+    Иначе ищем заголовок ``X-Trace-Id`` в ``headers`` (case-insensitive).
+    Возвращаем только валидный UUID.
+    """
+    # 1. Из тела сообщения (PayloadSchema.trace_id)
+    if trace_id is not None:
+        return str(trace_id)
+
+    # 2. Из заголовка X-Trace-Id
+    if headers:
+        for key, value in headers:
+            if key.lower() == _TRACE_ID_HEADER.lower():
+                try:
+                    UUID(value)
+                    return value
+                except ValueError:
+                    pass
+                return None  # нашли X-Trace-Id, но не UUID — не используем
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +310,9 @@ async def post(
     scheduler = request.app.state.scheduler
     message_id = str(uuid4())
 
+    # ── trace_id: из тела запроса, либо из заголовка X-Trace-Id ──
+    trace_id = _resolve_trace_id(payload.trace_id, payload.headers)
+
     schedule_id = await create_delivery_schedule(
         scheduler,
         destination="http",
@@ -254,18 +322,18 @@ async def post(
         timeout=payload.timeout,
         pause=payload.pause,
         ttl=payload.ttl,
+        trace_id=trace_id,
         message_id=message_id,
     )
 
-    logger = get_logger("http")
-    logger.info(
-        "payload_received",
+    PayloadReceivedEvent(
         message_id=message_id,
         destination="http",
         url=str(payload.url),
-        headers=([list(h) for h in payload.headers] if payload.headers else None),
+        headers=fmt_headers(payload.headers),
         timeout=payload.timeout,
         pause=payload.pause,
         ttl=payload.ttl,
+        trace_id=trace_id,
         schedule_id=schedule_id,
-    )
+    ).emit()

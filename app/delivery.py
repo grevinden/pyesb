@@ -13,12 +13,26 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import httpx
-import structlog
 from aiorun import shutdown_waits_for
 from apscheduler import CoalescePolicy, current_async_scheduler, current_job
 from apscheduler.triggers.interval import IntervalTrigger
 
-logger = structlog.get_logger("delivery")
+from .context import message_id_var, trace_id_var
+from .events import (
+    DeliveryAttemptEvent,
+    DeliveryFailedEvent,
+    DeliveryHttpErrorEvent,
+    DeliveryResponseEvent,
+    DeliveryScheduledEvent,
+    DeliverySkippedShutdownEvent,
+    DeliverySuccessEvent,
+    ScheduleRemoveSkippedEvent,
+    ShutdownCancelledEvent,
+    ShutdownDeliveriesCompletedEvent,
+    ShutdownTimeoutEvent,
+    ShutdownWaitingEvent,
+    fmt_headers,
+)
 
 # ── Shutdown guard ───────────────────────────────────────────────────
 # Множество asyncio.Task-ов, которые сейчас выполняют HTTP-запрос.
@@ -28,6 +42,7 @@ _in_flight: set[asyncio.Task] = set()
 # Флаг: приложение выключается. Новые вызовы deliver_payload
 # не выполняют HTTP-запрос, а сразу возвращаются (no-op).
 _shutting_down: bool = False
+
 
 _MAX_BODY_CHARS: int = 4096
 _MAX_RESPONSE_BODY_CHARS: int = 4096
@@ -44,6 +59,7 @@ async def deliver_payload(
     timeout: int,
     destination: str,
     message_id: str,
+    trace_id: str | None = None,
 ) -> None:
     """Выполняет одну попытку POST-доставки.
 
@@ -56,13 +72,18 @@ async def deliver_payload(
     """
     # ── Shutdown guard ────────────────────────────────────────────────
     if _shutting_down:
-        logger.warning(
-            "delivery_skipped_shutdown",
+        DeliverySkippedShutdownEvent(
             message_id=message_id,
+            trace_id=trace_id,
             destination=destination,
             url=url,
-        )
+        ).emit()
         return
+
+    # Фиксируем message_id и trace_id в contextvars — structlog
+    # автоматически inject их во все последующие логи.
+    message_id_var.set(message_id)
+    trace_id_var.set(trace_id)
 
     job = current_job.get()
     schedule_id: str = job.schedule_id if job.schedule_id is not None else "unknown"
@@ -72,20 +93,19 @@ async def deliver_payload(
 
     # Регистрируемся как in-flight — shutdown будет ждать нас
     current_task = asyncio.current_task()
+    assert current_task is not None, "deliver_payload must run inside an asyncio task"
     _in_flight.add(current_task)
     try:
         # ── delivery_attempt ──────────────────────────────────────────
-        logger.info(
-            "delivery_attempt",
-            message_id=message_id,
+        DeliveryAttemptEvent(
             schedule_id=schedule_id,
             destination=destination,
             url=url,
-            headers=([list(h) for h in headers] if headers else None),
+            headers=fmt_headers(headers),
             body_size=_json_size(body),
             body=body_repr,
             timeout=timeout,
-        )
+        ).emit()
 
         # ── HTTP POST (защищённый от отмены) ──────────────────────────
         t0 = datetime.now(timezone.utc)
@@ -107,9 +127,7 @@ async def deliver_payload(
             resp_body = _truncate_text(resp.text, _MAX_RESPONSE_BODY_CHARS)
 
             # ── delivery_response (ДО raise_for_status) ───────────────
-            logger.info(
-                "delivery_response",
-                message_id=message_id,
+            DeliveryResponseEvent(
                 schedule_id=schedule_id,
                 destination=destination,
                 url=url,
@@ -117,46 +135,40 @@ async def deliver_payload(
                 response_headers=dict(resp.headers),
                 response_body=resp_body,
                 duration_ms=duration_ms,
-            )
+            ).emit()
 
             resp.raise_for_status()
 
         except httpx.HTTPStatusError as exc:
-            logger.warning(
-                "delivery_http_error",
-                message_id=message_id,
+            DeliveryHttpErrorEvent(
                 schedule_id=schedule_id,
                 destination=destination,
                 url=url,
                 status_code=exc.response.status_code,
                 error=_short_exc(exc),
-            )
+            ).emit()
             return  # APScheduler повторит по IntervalTrigger
 
         except Exception as exc:
             duration_ms = _elapsed_ms(t0)
-            logger.error(
-                "delivery_failed",
-                message_id=message_id,
+            DeliveryFailedEvent(
                 schedule_id=schedule_id,
                 destination=destination,
                 url=url,
                 error=_short_exc(exc),
                 duration_ms=duration_ms,
-            )
+            ).emit()
             return  # APScheduler повторит по IntervalTrigger
 
         # ── delivery_success ──────────────────────────────────────────
         duration_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
-        logger.info(
-            "delivery_success",
-            message_id=message_id,
+        DeliverySuccessEvent(
             schedule_id=schedule_id,
             destination=destination,
             url=url,
             status_code=resp.status_code,
             duration_ms=duration_ms,
-        )
+        ).emit()
 
         # Убираем расписание — доставлено
         sched = current_async_scheduler.get()
@@ -164,7 +176,7 @@ async def deliver_payload(
             try:
                 await sched.remove_schedule(schedule_id)
             except (LookupError, Exception):
-                logger.debug("schedule_remove_skipped", schedule_id=schedule_id)
+                ScheduleRemoveSkippedEvent(schedule_id=schedule_id).emit()
 
     finally:
         _in_flight.discard(current_task)
@@ -183,20 +195,17 @@ async def wait_for_in_flight(timeout: float = 30) -> None:
     """
     if not _in_flight:
         return
-    logger.info(
-        "shutdown: waiting_for_deliveries",
-        count=len(_in_flight),
-        timeout=timeout,
-    )
+    ShutdownWaitingEvent(count=len(_in_flight), timeout=timeout).emit()
     done, pending = await asyncio.wait(_in_flight.copy(), timeout=timeout)
     if pending:
-        logger.warning(
-            "shutdown: deliveries_timeout",
-            remaining=len(pending),
-            timeout=timeout,
-        )
+        ShutdownTimeoutEvent(remaining=len(pending), timeout=timeout).emit()
+        # Force cancel
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        ShutdownCancelledEvent(count=len(pending)).emit()
     else:
-        logger.info("shutdown: deliveries_completed")
+        ShutdownDeliveriesCompletedEvent().emit()
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +223,7 @@ async def create_delivery_schedule(
     timeout: int,
     pause: int,
     ttl: int,
+    trace_id: str | None = None,
     message_id: str,
 ) -> str:
     """Создать APScheduler Schedule для доставки payload'а.
@@ -237,21 +247,21 @@ async def create_delivery_schedule(
             end_time=end,
         ),
         id=schedule_id,
-        args=[url, body, headers, timeout, destination, message_id],
+        args=[url, body, headers, timeout, destination, message_id, trace_id],
         misfire_grace_time=None,
         coalesce=CoalescePolicy.latest,
     )
 
-    logger.info(
-        "delivery_scheduled",
+    DeliveryScheduledEvent(
         message_id=message_id,
         schedule_id=schedule_id,
         destination=destination,
         url=url,
         pause=pause,
         ttl=ttl,
+        trace_id=trace_id,
         end_time=end.isoformat(),
-    )
+    ).emit()
 
     return schedule_id
 
