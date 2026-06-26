@@ -16,10 +16,12 @@ import httpx
 from aiorun import shutdown_waits_for
 from apscheduler import CoalescePolicy, current_async_scheduler, current_job
 from apscheduler.triggers.interval import IntervalTrigger
+from cashews import CircuitBreakerOpen, cache
 
 from .config import settings
 from .context import message_id_var, trace_id_var
 from .events import (
+    CircuitBreakerOpenEvent,
     DeliveryAttemptEvent,
     DeliveryFailedEvent,
     DeliveryHttpErrorEvent,
@@ -39,9 +41,7 @@ from .events import (
 # Семафор ограничивает количество одновременно выполняемых HTTP-запросов.
 # Предотвращает исчерпание соединений (DB, внешние API, сокеты)
 # при всплеске нагрузки.
-_delivery_semaphore: asyncio.Semaphore = asyncio.Semaphore(
-    settings.MAX_CONCURRENT_DELIVERIES
-)
+_delivery_semaphore: asyncio.Semaphore = asyncio.Semaphore(settings.MAX_CONCURRENT_DELIVERIES)
 """Maximum concurrent HTTP deliveries (across all destinations).
 
 Выбирается исходя из:
@@ -50,11 +50,49 @@ _delivery_semaphore: asyncio.Semaphore = asyncio.Semaphore(
 * размера пула соединений ``httpx``.
 """
 
+# ── Circuit breaker (cashews) ───────────────────────────────────────────
+# In-memory circuit breaker для защиты целевых серверов от повторяющихся
+# ошибок. Circuit breaker per URL: если за минуту >10 ошибок на URL,
+# доставка на этот URL приостанавливается на 5 минут.
+# Не требует Redis — in-memory достаточно для защиты от лавины.
+cache.setup("mem://")
+
 # ── Shared httpx client ──────────────────────────────────────────────
 # Один AsyncClient на все HTTP-доставки — пул соединений,
 # не создаём клиент на каждый запрос (C2 performance fix).
 _http_client: httpx.AsyncClient | None = None
 """Lazily initialized shared HTTP client. Close via ``close_http_client()``."""
+
+
+@cache.circuit_breaker(
+    errors_rate=10,
+    period="1m",
+    ttl="5m",
+    half_open_ttl="1m",
+    key="{url}",
+)
+async def _http_post_with_cb(
+    client: httpx.AsyncClient,
+    url: str,
+    headers_dict: dict[str, str],
+    body: dict | list | None,
+    timeout: int,
+) -> httpx.Response:
+    """HTTP POST с circuit breaker per URL.
+
+    Если за последнюю минуту на этот URL было >=10 ошибок,
+    circuit breaker размыкается на 5 минут ("open").
+    Все последующие вызовы на этот URL сразу бросают
+    ``CircuitBreakerOpen`` — без реального HTTP-запроса.
+
+    Через 1 минуту half-open — один запрос пропускается.
+    Если успешен — circuit breaker закрывается ("closed"),
+    если нет — снова открывается на 5 минут.
+
+    Это защищает целевой сервер от лавины запросов,
+    когда он уже падает или перегружен.
+    """
+    return await client.post(url, json=body, headers=headers_dict, timeout=timeout)
 
 
 def _get_http_client() -> httpx.AsyncClient:
@@ -103,8 +141,9 @@ _schedule_end_times: dict[str, datetime] = {}
 _attempt_counts: dict[str, int] = {}
 
 
-_MAX_BODY_CHARS: int = 4096
-_MAX_RESPONSE_BODY_CHARS: int = 4096
+# Log body limits (configurable via FWQ_LOG_BODY_MAX_CHARS / FWQ_LOG_RESPONSE_BODY_MAX_CHARS)
+_MAX_BODY_CHARS: int = settings.LOG_BODY_MAX_CHARS
+_MAX_RESPONSE_BODY_CHARS: int = settings.LOG_RESPONSE_BODY_MAX_CHARS
 
 # ---------------------------------------------------------------------------
 # APScheduler-совместимая функция доставки (один вызов = одна попытка)
@@ -198,11 +237,12 @@ async def deliver_payload(
             в нашем APScheduler-контейнере.
             """
             client = _get_http_client()
-            return await client.post(
+            return await _http_post_with_cb(
+                client,
                 url,
-                json=body,
-                headers=headers_dict,
-                timeout=timeout,
+                headers_dict,
+                body,
+                timeout,
             )
 
         try:
@@ -242,6 +282,17 @@ async def deliver_payload(
                 trace_id,
             )
             return  # APScheduler повторит по IntervalTrigger
+
+        except CircuitBreakerOpen as exc:
+            CircuitBreakerOpenEvent(
+                schedule_id=schedule_id,
+                destination=destination,
+                url=url,
+                error=_short_exc(exc),
+            ).emit()
+            # НЕ вызываем _check_permanent_failure — circuit breaker
+            # временный, APScheduler повторит позже.
+            return
 
         except Exception as exc:
             duration_ms = _elapsed_ms(t0)

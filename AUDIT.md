@@ -1,4 +1,4 @@
-# Audit: pyesb — 1C ESB Gateway
+# Audit: pyesb-webhooker — Webhook Delivery Service
 
 > Комплексный аудит проекта по всем параметрам.
 > Создан: 2026-06-26
@@ -355,14 +355,26 @@
 | H3 | Нет histogram метрик | `middleware.py` | ✅ **Исправлено**: duration_histogram |
 | H4 | WAL mode для SQLite не включён | `database.py` | ✅ **Исправлено**: setup_db() с WAL |
 
+### Исправлено (Medium)
+| # | Проблема | Модуль | Статус |
+|---|----------|--------|--------|
+| M1 | PII в логах (headers) | `events.py` | ✅ **Исправлено**: header sanitization processor |
+| M4 | `_MAX_BODY_CHARS`, `_MAX_RESPONSE_BODY_CHARS` хардкод | `delivery.py` | ✅ **Исправлено**: вынесено в config (FWQ_LOG_BODY_MAX_CHARS, FWQ_LOG_RESPONSE_BODY_MAX_CHARS) |
+| M5 | PII в теле запроса/ответа | `log.py` | ✅ **Исправлено**: `_mask_pii_body` processor (FWQ_PII_BODY_KEYS) |
+| L1 | README.md — устаревшая структура | `README.md` | ✅ **Исправлено**: обновлена структура, команды, конфиги |
+
+> **Контекст:** приложение работает исключительно в Docker/K8s. Это означает:
+> - Log rotation не нужен (Docker собирает stdout/stderr)
+> - `BIND_HOST=0.0.0.0` — корректное значение для контейнера
+> - graceful shutdown (SIGTERM → aiorun) критичен для K8s — ✅ реализован
+> - Health checks + Metrics — готовы для K8s liveness/readiness probes
+> - Security (non-root user, multi-stage build) — ✅ реализованы в Dockerfile
+
 ### Остаются открытыми
 | # | Проблема | Модуль | Статус |
 |---|----------|--------|--------|
-| H2 | Нет Dockerfile | проект | ⏳ Нужен |
-| H5 | stderr pipe надёжность | `log.py` | ⏳ Нужен review |
-| M1 | PII в логах (headers) | `events.py` | ✅ **Исправлено**: header sanitization processor |
-| M2 | docstring вне функции (wait_for_in_flight) | `delivery.py` | ⏳ Нужен review |
-| M3 | `BIND_HOST=0.0.0.0` по умолчанию | `config.py` | ⏳ Нужен review |
-| M4 | `_MAX_BODY_CHARS`, `_MAX_RESPONSE_BODY_CHARS` хардкод | `delivery.py` | ⏳ Нужен review |
-| L1 | README.md — устаревшая структура | `README.md` | ⏳ Нужен review |
-| L2 | `noqa: F821` для app.state | `lifespan.py` | ⏳ Нужен review |
+| C4 | `apscheduler>=4.0.0a6` — alpha версия | `pyproject.toml` | ⏳ Ожидает stable-релиза APScheduler 4.x |
+| H2 | Dockerfile — улучшен (multi-stage, non-root) | проект | ⏳ Нужен `docker build .` для проверки |
+| H5 | stderr pipe надёжность | `log.py` | ⏳ Низкий приоритет (в контейнере stderr → Docker logs) |
+| M2 | docstring вне функции (wait_for_in_flight) | `delivery.py` | ⏳ Косметика |
+| L2 | `noqa: F821` для app.state | `lifespan.py` | ⏳ Косметика (runtime injection) |

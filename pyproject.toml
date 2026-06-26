@@ -1,5 +1,5 @@
 [project]
-name = "pyesb"
+name = "pyesb-webhooker"
 
 dynamic = ["version"]
 description = "1C ESB Gateway compatible server"
@@ -16,6 +16,7 @@ dependencies = [
     "httpx>=0.28.1",
     "aiorun>=2025.1.1",
     "python-ulid>=3.1.0",
+    "cashews>=7.5.0",
 ]
 
 [tool.uv]

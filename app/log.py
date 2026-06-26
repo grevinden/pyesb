@@ -5,7 +5,7 @@ Usage::
     from app.events import SomeEvent
     SomeEvent(...).emit()
 
-Для stderr redirect (Rust tracing pyesb-amqp) используется
+Для stderr redirect (Rust tracing из pyesb-amqp) используется
 ``_jsonl_line()`` — обёртка с ``dt`` и ``ulid``.
 """
 
@@ -205,6 +205,57 @@ def _sanitize_headers(
     return event_dict
 
 
+def _mask_pii_body(
+    logger: structlog.stdlib.BoundLogger,
+    method_name: str,
+    event_dict: MutableMapping[str, object],
+) -> MutableMapping[str, object]:
+    """Mask sensitive fields in request/response body logged to JSONL.
+
+    Ищет ключи ``body`` и ``response_body`` в event_dict.
+    Если значение — строка JSON, парсит её и маскирует поля,
+    чьи имена (case-insensitive) совпадают с ``settings.PII_BODY_KEYS``.
+
+    Это **не** меняет исходные данные — только вывод в лог.
+    """
+    import json as _json_mod
+
+    from .config import settings
+
+    pii_keys = settings.PII_BODY_KEYS
+    if not pii_keys:
+        return event_dict
+
+    for key in ("body", "response_body"):
+        raw = event_dict.get(key)
+        if not isinstance(raw, str):
+            continue
+        try:
+            parsed = _json_mod.loads(raw)
+        except (_json_mod.JSONDecodeError, ValueError):
+            continue
+        masked = _mask_pii_value(parsed, pii_keys)
+        event_dict[key] = _json_mod.dumps(masked, default=str)
+
+    return event_dict
+
+
+def _mask_pii_value(value: object, pii_keys: frozenset[str]) -> object:
+    """Recursively mask PII fields in a JSON-like structure.
+
+    Заменяет значения ключей, присутствующих в ``pii_keys``
+    (case-insensitive), на ``"***"``.
+    """
+    if isinstance(value, dict):
+        return {
+            k: ("***" if k.lower() in pii_keys else _mask_pii_value(v, pii_keys))
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_mask_pii_value(item, pii_keys) for item in value]
+    return value
+
+
 # ---------------------------------------------------------------------------
 # structlog processor: inject message_id from contextvars
 # ---------------------------------------------------------------------------
@@ -338,6 +389,7 @@ def load_logging_config() -> None:
             structlog.processors.StackInfoRenderer(),
             structlog.dev.set_exc_info,
             _sanitize_headers,  # mask sensitive headers in logs
+            _mask_pii_body,  # mask PII fields in request/response body
             _add_context_vars,  # inject message_id, trace_id from contextvars
             # wrap_for_formatter — финальный процессор для structlog-записей.
             # Он преобразует event_dict в строку и кладёт её в LogRecord.msg.

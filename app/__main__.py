@@ -1,4 +1,4 @@
-"""Entry point: ``uv run python -m app``
+"""Entry point: ``uv run --module app``
 
 Разворачивает uvicorn поверх ``aiorun.run()``.
 Управление сигналами — uvicorn (``loop.add_signal_handler`` внутри ``serve()``).
@@ -33,7 +33,7 @@ async def _async_main() -> None:
     server: uvicorn.Server | None = None
     try:
         config = uvicorn.Config(
-            app,
+            app=app,
             host=settings.BIND_HOST,
             port=settings.BIND_PORT,
             workers=1,
@@ -67,5 +67,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     if _mp.parent_process() is not None:
-        sys.exit("pyesb: cannot run in a child process (workers must be 1)")
+        sys.exit("pyesb-webhooker: cannot run in a child process (workers must be 1)")
     main()

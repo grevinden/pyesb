@@ -23,9 +23,7 @@ class Settings:
     BIND_PORT: int = int(os.getenv("FWQ_BIND_PORT", "8000"))
 
     # ── Concurrency ────────────────────────────────────────────────────
-    MAX_CONCURRENT_DELIVERIES: int = int(
-        os.getenv("FWQ_MAX_CONCURRENT_DELIVERIES", "50")
-    )
+    MAX_CONCURRENT_DELIVERIES: int = int(os.getenv("FWQ_MAX_CONCURRENT_DELIVERIES", "50"))
     """Semaphore limit — одновременные HTTP-доставки."""
 
     SCHEDULER_MAX_CONCURRENT: int = int(os.getenv("FWQ_SCHEDULER_MAX_CONCURRENT", "20"))
@@ -52,6 +50,22 @@ class Settings:
 
     DEFAULT_TIMEOUT: int = int(os.getenv("FWQ_DEFAULT_TIMEOUT", "30"))
     """HTTP-таймаут по умолчанию (сек)."""
+
+    # ── Logging limits ───────────────────────────────────────────────────
+    LOG_BODY_MAX_CHARS: int = int(os.getenv("FWQ_LOG_BODY_MAX_CHARS", "4096"))
+    """Максимальная длина тела запроса в логах (символов)."""
+
+    LOG_RESPONSE_BODY_MAX_CHARS: int = int(os.getenv("FWQ_LOG_RESPONSE_BODY_MAX_CHARS", "4096"))
+    """Максимальная длина тела ответа в логах (символов)."""
+
+    # ── PII masking ──────────────────────────────────────────────────────
+    PII_BODY_KEYS: frozenset[str] = frozenset(
+        os.getenv(
+            "FWQ_PII_BODY_KEYS",
+            "password,secret,token,passport,phone,email,inn,snils,credit_card,birth_date",
+        ).split(",")
+    )
+    """Ключи в теле запроса, значения которых маскируются в логах (case-insensitive)."""
 
 
 # Module-level singleton (import once → frozen dataclass)

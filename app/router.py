@@ -5,7 +5,7 @@
 живут здесь.
 
 В текущей версии роутинг простой:
-* AMQP: destination приходит из routing key (устанавливается pyesb_amqp).
+* AMQP: destination приходит из routing key (устанавливается pyesb-amqp).
 * HTTP: destination = ``"http"``.
 * trace_id: из тела сообщения (приоритет) или заголовка ``X-Trace-Id``.
 """

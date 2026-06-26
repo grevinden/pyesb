@@ -50,6 +50,7 @@ from pydantic.types import PastDatetime
 from ulid import ULID
 
 __all__ = [
+    "CircuitBreakerOpenEvent",
     "DeliveryAttemptEvent",
     "DeliveryEventBase",
     "DeliveryExpiredEvent",
@@ -273,7 +274,7 @@ class PayloadReceivedAMQPEvent(PayloadReceivedEvent):
 
     ``delivery_count`` — сколько раз AMQP-брокер уже выдавал это сообщение
     (поле ``Header.delivery_count``). Позволяет детектить повторные
-    доставки со стороны брокера (не путать с retry-циклом pyesb).
+    доставки со стороны брокера (не путать с retry-циклом webhooker'а).
     """
 
     _event_name: ClassVar[str] = "payload_received"
@@ -378,7 +379,7 @@ class ShutdownCompleteEvent(LogEvent):
 
 
 class StderrReaderErrorEvent(LogEvent):
-    """Неожиданная ошибка в stderr-reader (pyesb-amqp Rust tracing), перезапуск."""
+    """Неожиданная ошибка в stderr-reader (Rust tracing pyesb-amqp), перезапуск."""
 
     _event_name: ClassVar[str] = "stderr_to_jsonl_error, restarting"
     _level: ClassVar[str] = "exception"
@@ -403,6 +404,24 @@ class UnhandledTaskErrorEvent(LogEvent):
     _event_name: ClassVar[str] = "unhandled_task_error"
     _level: ClassVar[str] = "exception"
     task_name: str | None = None
+
+
+class CircuitBreakerOpenEvent(DeliveryEventBase):
+    """Circuit breaker разомкнут — HTTP-доставка на URL приостановлена.
+
+    Целевой сервер временно недоступен (>=10 ошибок за последнюю минуту).
+    Доставка на этот URL приостанавливается на ``ttl`` (5 минут по умолчанию),
+    после чего circuit breaker переходит в half-open состояние
+    и пропускает один запрос для проверки.
+
+    APScheduler продолжит попытки, circuit breaker сам восстановится.
+    Это НЕ permanent failure (``DeliveryExpiredEvent`` будет отдельно,
+    если TTL истёк, а сервер всё ещё недоступен).
+    """
+
+    _event_name: ClassVar[str] = "circuit_breaker_open"
+    _level: ClassVar[str] = "warning"
+    error: str
 
 
 class DeliveryExpiredEvent(ScheduleRef, TargetRef, MessageRef):

@@ -1,7 +1,9 @@
-"""1C ESB Gateway — FastAPI + APScheduler delivery + async SQLite.
+"""pyesb-webhooker — Webhook Delivery Service.
 
-Все события доставки пишутся в JSONL через structlog.
-БД (``data.db``) содержит только APScheduler-таблицы — мелкая, не пухнет.
+FastAPI + APScheduler + async SQLite.
+Принимает уведомления по AMQP (из 1С) или HTTP POST,
+доставляет на внешние URL с retry до истечения TTL.
+Все события пишутся в JSONL через structlog.
 """
 
 from __future__ import annotations
@@ -39,28 +41,21 @@ from .router import resolve_trace_id
 app = oidc_add_routes(
     ChannelDesription(
         access="WRITE_ONLY",
-        process="process1",
-        channel="channel1",
-        destination="destination1",
-        process_description="process_description1",
-        channel_description="channel_description1",
-    ),
-    ChannelDesription(
-        access="WRITE_ONLY",
-        process="process2",
-        channel="channel2",
-        destination="destination2",
-        process_description="process_description2",
-        channel_description="channel_description2",
+        process="WebhookDeliveryService",
+        channel="HttpPost",
+        destination="HttpPost",
+        process_description="Сервис доставки уведомлений",
+        channel_description="Отправка сообщение через HTTP POST",
     ),
     app=FastAPI(
-        title="1C ESB Gateway",
+        title="pyesb-webhooker",
         description=(
-            "Compatible server for 1C Enterprise ESB integration (OIDC + AMQP).\n"
-            "Принимает уведомления по AMQP (из 1С) или HTTP POST."
+            "Webhook Delivery Service — доставщик уведомлений.\n"
+            "Принимает сообщения по AMQP (из 1С) или HTTP POST "
+            "и доставляет на внешние URL с повторными попытками до истечения TTL."
         ),
         version="0.1.0",
-        docs_url="/docs",
+        docs_url="/",
         redoc_url=None,
         redirect_slashes=False,
         openapi_url="/openapi.json",
