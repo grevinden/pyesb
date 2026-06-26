@@ -15,14 +15,14 @@ from unittest.mock import patch
 
 import pytest
 
-from app.delivery import _delivery_semaphore, wait_for_in_flight
-from app.middleware import (
+from app.delivery.middleware import (
     DeliveryContext,
     MetricsMiddleware,
     Middleware,
     MiddlewarePipeline,
 )
-from app.tasks import safe_create_task
+from app.delivery.semaphore import _delivery_semaphore, wait_for_in_flight
+from app.delivery.tasks import safe_create_task
 
 # ═══════════════════════════════════════════════════════════════════════
 # 1. Semaphore — конкурентность

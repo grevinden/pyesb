@@ -4,43 +4,26 @@ from __future__ import annotations
 
 from uuid import uuid4
 
-from app.router import first_str, resolve_trace_id
+from app.ingress.router import first_str, resolve_trace_id
 
 
 class TestResolveTraceId:
-    def test_from_body_trace_id(self) -> None:
-        trace_id = uuid4()
-        result = resolve_trace_id(trace_id, None)
-        assert result == str(trace_id)
+    def test_valid_uuid(self) -> None:
+        tid = str(uuid4())
+        result = resolve_trace_id(tid)
+        assert result == tid
 
-    def test_from_header(self) -> None:
-        trace_id = uuid4()
-        headers = {("X-Trace-Id", str(trace_id))}
-        result = resolve_trace_id(None, headers)
-        assert result == str(trace_id)
-
-    def test_header_case_insensitive(self) -> None:
-        trace_id = uuid4()
-        headers = {("x-trace-id", str(trace_id))}
-        result = resolve_trace_id(None, headers)
-        assert result == str(trace_id)
-
-    def test_no_trace_id(self) -> None:
-        result = resolve_trace_id(None, None)
+    def test_none(self) -> None:
+        result = resolve_trace_id(None)
         assert result is None
 
-    def test_invalid_uuid_in_header(self) -> None:
-        headers = {("X-Trace-Id", "not-a-uuid")}
-        result = resolve_trace_id(None, headers)
+    def test_empty_string(self) -> None:
+        result = resolve_trace_id("")
         assert result is None
 
-    def test_prefers_body_over_header(self) -> None:
-        body_trace = uuid4()
-        header_trace = uuid4()
-        headers = {("X-Trace-Id", str(header_trace))}
-        result = resolve_trace_id(body_trace, headers)
-        assert result == str(body_trace)  # body wins
-        assert result != str(header_trace)
+    def test_invalid_uuid(self) -> None:
+        result = resolve_trace_id("not-a-uuid")
+        assert result is None
 
 
 class TestFirstStr:

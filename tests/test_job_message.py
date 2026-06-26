@@ -9,7 +9,7 @@ import pytest
 from pydantic import ValidationError
 from pyesb_amqp import E1CMessage
 
-from app.models import Message, PayloadSchema
+from app.ingress.models import Message, PayloadSchema
 
 
 def make_payload_bytes(
@@ -25,17 +25,15 @@ def make_payload_bytes(
     """JSON-encoded Payload, готовый для передачи как body в Message."""
     if headers is None:
         headers = [("X-Api-Key", "secret")]
-    return json.dumps(
-        {
-            "url": url,
-            "body": body,
-            "headers": headers,
-            "timeout": timeout,
-            "pause": pause,
-            "ttl": ttl,
-            "destination": destination,
-        }
-    ).encode()
+    return json.dumps({
+        "url": url,
+        "body": body,
+        "headers": headers,
+        "timeout": timeout,
+        "pause": pause,
+        "ttl": ttl,
+        "destination": destination,
+    }).encode()
 
 
 def make_kwargs(body: bytes | None = None) -> dict:
@@ -166,13 +164,13 @@ class TestMessageSerialization:
         restored = PayloadSchema.model_validate_json(raw)
         assert restored.url == msg.payload.url
 
-    def test_payload_dumped_as_dict(self) -> None:
-        """Json[PayloadSchema] при dump даёт dict."""
+    def test_body_dumped_as_dict(self) -> None:
+        """body (Json[PayloadSchema]) при dump даёт dict."""
         msg = Message(**make_kwargs())
         dumped = msg.model_dump(mode="json")
-        assert isinstance(dumped["payload"], dict)
-        assert dumped["payload"]["url"] == "http://example.com/hook"
-        assert dumped["payload"]["timeout"] == 10
+        assert isinstance(dumped["body"], dict)
+        assert dumped["body"]["url"] == "http://example.com/hook"
+        assert dumped["body"]["timeout"] == 10
 
     def test_json_schema(self) -> None:
         schema = Message.model_json_schema()

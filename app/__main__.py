@@ -9,7 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import multiprocessing as _mp
+import os
 import sys
+
+# ── CLI args ─────────────────────────────────────────────────────────────
+# Устанавливаем env vars ДО импорта app.config (settings — frozen singleton)
+if "--pretty-log" in sys.argv:
+    os.environ.setdefault("FWQ_PRETTY_LOG", "true")
 
 import uvicorn
 from aiorun import run
@@ -33,13 +39,13 @@ async def _async_main() -> None:
     server: uvicorn.Server | None = None
     try:
         config = uvicorn.Config(
-            app=app,
+            app,
             host=settings.BIND_HOST,
             port=settings.BIND_PORT,
-            workers=1,
             reload=False,
+            workers=1,
+            log_config=None,  # наш JSONL-лог, не uvicorn-дефолт (пишет в stderr)
         )
-        config.load_app()
         server = uvicorn.Server(config=config)
         _server_ref.append(server)
 

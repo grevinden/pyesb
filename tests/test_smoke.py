@@ -144,7 +144,7 @@ class TestSmokePostEndpoint:
         self,
         client: AsyncClient,
     ) -> None:
-        """trace_id в теле запроса принимается."""
+        """trace_id в HTTP-заголовке x-trace-id принимается."""
         trace_id = str(uuid4())
         payload = {
             "url": "http://example.com/hook",
@@ -152,9 +152,8 @@ class TestSmokePostEndpoint:
             "timeout": 10,
             "pause": 5,
             "ttl": 60,
-            "trace_id": trace_id,
         }
-        resp = await client.post("/", json=payload)
+        resp = await client.post("/", json=payload, headers={"x-trace-id": trace_id})
         assert resp.status_code == 204
 
 

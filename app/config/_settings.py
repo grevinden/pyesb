@@ -1,4 +1,4 @@
-"""Configuration — единственный источник truth для всех параметров.
+"""``app.config._settings`` — единственный источник truth для всех параметров.
 
 Все hardcoded значения вынесены в переменные окружения (префикс ``FWQ_``).
 Использование::
@@ -6,6 +6,9 @@
     from app.config import settings
 
     sem = asyncio.Semaphore(settings.MAX_CONCURRENT_DELIVERIES)
+
+Settings — frozen dataclass, создаётся при первом импорте.
+Environment variables читаются ОДИН раз при старте процесса.
 """
 
 from __future__ import annotations
@@ -58,14 +61,13 @@ class Settings:
     LOG_RESPONSE_BODY_MAX_CHARS: int = int(os.getenv("FWQ_LOG_RESPONSE_BODY_MAX_CHARS", "4096"))
     """Максимальная длина тела ответа в логах (символов)."""
 
-    # ── PII masking ──────────────────────────────────────────────────────
-    PII_BODY_KEYS: frozenset[str] = frozenset(
-        os.getenv(
-            "FWQ_PII_BODY_KEYS",
-            "password,secret,token,passport,phone,email,inn,snils,credit_card,birth_date",
-        ).split(",")
-    )
-    """Ключи в теле запроса, значения которых маскируются в логах (case-insensitive)."""
+    # ── Pretty print ───────────────────────────────────────────────────
+    PRETTY_LOG: bool = os.getenv("FWQ_PRETTY_LOG", "").lower() in ("1", "true", "yes")
+    """Форматированный вывод логов (indent=2) для разработки."""
+
+    # ── Metrics ──────────────────────────────────────────────────────────
+    DURATION_BUCKETS_MS: tuple[int, ...] = (10, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 30000)
+    """Границы гистограммы длительности доставки (мс)."""
 
 
 # Module-level singleton (import once → frozen dataclass)

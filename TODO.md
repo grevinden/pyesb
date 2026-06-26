@@ -1,7 +1,0 @@
-- url
-- body
-- headers
-- read_timeount
-- пауза_повтора
-- колво_попыток
-- skip ssl check

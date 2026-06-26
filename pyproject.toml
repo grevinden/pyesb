@@ -2,7 +2,7 @@
 name = "pyesb-webhooker"
 
 dynamic = ["version"]
-description = "1C ESB Gateway compatible server"
+description = "Container-native webhook delivery service — принимает уведомления из 1С (AMQP) или HTTP POST и доставляет на внешние URL с retry, circuit breaker и JSONL-логом"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -10,7 +10,6 @@ dependencies = [
     "pyesb-amqp",
     "aiosqlite>=0.20.0",
     "sqlalchemy[asyncio]>=2.0",
-    "structlog>=25.1.0",
     "pyyaml>=6.0.1",
     "apscheduler>=4.0.0a6",
     "httpx>=0.28.1",
@@ -89,7 +88,6 @@ ignore = [
     "RUF059",   # unused variable in tuple unpack
     "S101",     # assert — intentional in delivery.py
     "PIE790",   # unnecessary pass — pre-existing in events.py
-    "ARG001",   # unused function arg — structlog processor signature
     "B024",     # abstract base class — Middleware is intentionally abstract
     "PLC0415",  # import inside function — lazy import avoids circular deps
     "TRY300",   # else block style — pre-existing
@@ -122,31 +120,15 @@ ignore = [
     "C420",    # dict.fromkeys
     "D415",    # docstring punctuation
 ]
-"app/delivery.py" = [
+"app/delivery/engine.py" = [
     "S101",     # assert current_task — intentional invariant check
     "PLC0415",  # lazy import json — performance (only on demand)
     "PLR0913", "PLR0915",  # APScheduler callback signature
 ]
-"app/lifespan.py" = [
-    "PLC0415",  # lazy imports to avoid circular deps
-    "TRY300",   # return in try block — amqp_handler style
+"app/delivery/client.py" = [
+    "PLC0415",  # lazy import
 ]
-"app/log.py" = [
-    "PLC0415",  # lazy imports (json, ULID) — only on demand
-    "ARG001",   # structlog processor signature (logger, method_name required)
-    "SIM105",   # try/except CancelledError — intentional
-]
-"app/main.py" = [
-    "PLC0415",  # lazy import create_delivery_schedule
-    "TC001",    # PayloadSchema used at runtime in endpoint
-]
-"app/events.py" = [
-    "PIE790",   # unnecessary pass in event classes — pre-existing style
-    "PLC0415",  # lazy import sys in exc_info()
-    "TC002", "TC003",  # TYPE_CHECKING imports
-    "D205", "D209",  # docstring style
-]
-"app/middleware.py" = [
+"app/delivery/middleware.py" = [
     "B024",     # Middleware is intentionally abstract (no abstract methods)
     "TC003",    # TYPE_CHECKING imports
     "D401",     # docstring mood
@@ -154,10 +136,34 @@ ignore = [
     "C420",     # dict.fromkeys — explicit comprehension is clearer
     "ARG002",   # unused ctx arg — middleware hook signature
 ]
-"app/tasks.py" = [
+"app/delivery/tasks.py" = [
     "PLC0415",  # lazy import events
     "D413",     # blank line after section
     "RET504",   # unnecessary assignment before return
+]
+"app/lifespan.py" = [
+    "PLC0415",  # lazy imports to avoid circular deps
+]
+"app/main.py" = [
+    "PLC0415",  # lazy import create_delivery_schedule
+    "TC001",    # PayloadSchema used at runtime in endpoint
+]
+"app/events/_schemas.py" = [
+    "PIE790",   # unnecessary pass in event classes — pre-existing style
+    "PLC0415",  # lazy import sys in exc_info()
+    "TC002", "TC003",  # TYPE_CHECKING imports
+    "D205", "D209",  # docstring style
+]
+"app/events/_formatter.py" = [
+    "PLC0415",  # lazy imports
+]
+"app/events/_stderr.py" = [
+    "PLC0415",  # lazy imports
+    "SIM105",   # try/except CancelledError — intentional
+]
+"app/ingress/amqp.py" = [
+    "PLC0415",  # lazy imports
+    "TRY300",   # return in try block
 ]
 
 [tool.mypy]

@@ -1,8 +1,9 @@
-"""Async SQLite engine singleton — only for APScheduler's SQLAlchemyDataStore.
+"""``app.config._database`` — Async SQLite engine singleton.
 
-WAL mode and busy timeout are set automatically on every new connection
-via SQLAlchemy's ``@event.listens_for``. This works correctly for both
-file-based (``data.db``) and in-memory (``:memory:``) databases.
+Only used by APScheduler's ``SQLAlchemyDataStore``. WAL mode and busy
+timeout are set automatically on every new connection via SQLAlchemy's
+``@event.listens_for``. This works correctly for both file-based
+(``data.db``) and in-memory (``:memory:``) databases.
 
 **Important:** ``poolclass`` is **not** set to ``NullPool`` because
 in-memory SQLite requires connection reuse — each connection to
@@ -15,7 +16,7 @@ from __future__ import annotations
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-from .config import settings
+from ._settings import settings
 
 __all__ = [
     "close_db",
@@ -76,3 +77,4 @@ async def setup_db() -> None:
     on every new connection. This function is kept for backward
     compatibility and for explicit calls in tests — currently a no-op.
     """
+    pass

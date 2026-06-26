@@ -3,7 +3,7 @@
 FastAPI + APScheduler + async SQLite.
 Принимает уведомления по AMQP (из 1С) или HTTP POST,
 доставляет на внешние URL с retry до истечения TTL.
-Все события пишутся в JSONL через structlog.
+Все события — Pydantic-модели с ``.emit()``, пишутся в JSONL напрямую.
 """
 
 from __future__ import annotations
@@ -14,11 +14,11 @@ from fastapi import FastAPI, Request
 from pyesb_amqp.oidc import ChannelDesription
 from pyesb_amqp.oidc import add_routes as oidc_add_routes
 
-from .events import PayloadReceivedEvent, fmt_headers
+from .delivery.middleware import duration_buckets
+from .events import PayloadReceivedEvent
+from .ingress.models import PayloadSchema
+from .ingress.router import resolve_trace_id
 from .lifespan import lifespan
-from .middleware import duration_buckets
-from .models import PayloadSchema
-from .router import resolve_trace_id
 
 # ---------------------------------------------------------------------------
 # Архитектура приёма сообщений
@@ -55,7 +55,7 @@ app = oidc_add_routes(
             "и доставляет на внешние URL с повторными попытками до истечения TTL."
         ),
         version="0.1.0",
-        docs_url="/",
+        docs_url="/docs",
         redoc_url=None,
         redirect_slashes=False,
         openapi_url="/openapi.json",
@@ -93,13 +93,12 @@ async def post(
     3. Попытки продолжаются до истечения ``ttl`` секунд с момента получения.
     4. При успехе (HTTP 2xx) расписание удаляется — повторных попыток не будет.
     """
-    from .delivery import create_delivery_schedule
+    from .orchestration.schedule import create_delivery_schedule
 
     scheduler = request.app.state.scheduler
     message_id = str(uuid4())
-
-    # ── trace_id: из тела запроса, либо из заголовка X-Trace-Id ──
-    trace_id = resolve_trace_id(payload.trace_id, payload.headers)
+    # ── trace_id: из HTTP-заголовка x-trace-id (необязательный, None = трассировка выключена) ──
+    trace_id = resolve_trace_id(request.headers.get("x-trace-id"))
 
     schedule_id = await create_delivery_schedule(
         scheduler,
@@ -118,7 +117,7 @@ async def post(
         message_id=message_id,
         destination="http",
         url=str(payload.url),
-        headers=fmt_headers(payload.headers),
+        headers=payload.headers,
         timeout=payload.timeout,
         pause=payload.pause,
         ttl=payload.ttl,
@@ -156,9 +155,9 @@ async def get_metrics(request: Request) -> dict[str, object]:
 # ---------------------------------------------------------------------------
 
 
-@app.get("/health", status_code=200)
 @app.get("/health/live", status_code=200)
 @app.get("/health/ready", status_code=200)
+@app.get("/health", status_code=200)
 async def health(request: Request) -> dict[str, object]:
     """Health check — статус компонентов системы.
 
@@ -166,7 +165,7 @@ async def health(request: Request) -> dict[str, object]:
     и uptime сервера.
     """
     scheduler = getattr(request.app.state, "scheduler", None)
-    from app.delivery import _in_flight, _shutting_down
+    from app.delivery.semaphore import _in_flight, _shutting_down
 
     return {
         "status": "ok",

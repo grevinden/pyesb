@@ -40,6 +40,7 @@ RUN addgroup --system --gid 1001 app && \
 USER app
 
 # Default config
+ENV PYTHONOPTIMIZE=2
 ENV FWQ_BIND_HOST=0.0.0.0
 ENV FWQ_BIND_PORT=8000
 ENV PATH="/app/.venv/bin:$PATH"

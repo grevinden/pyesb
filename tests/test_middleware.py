@@ -7,13 +7,13 @@ from unittest.mock import patch
 
 import pytest
 
-from app.middleware import (
+from app.delivery.middleware import (
     DeliveryContext,
     MetricsMiddleware,
     Middleware,
     MiddlewarePipeline,
 )
-from app.tasks import safe_create_task
+from app.delivery.tasks import safe_create_task
 
 # ═══════════════════════════════════════════════════════════════════════
 # app.tasks — safe_create_task

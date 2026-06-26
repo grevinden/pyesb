@@ -1,0 +1,79 @@
+version: 1
+disable_existing_loggers: false
+
+formatters:
+    json:
+        (): app.events.JsonlFormatter
+
+handlers:
+    console:
+        class: logging.StreamHandler
+        formatter: json
+        stream: ext://sys.stdout
+
+root:
+    level: INFO
+    handlers: [console]
+
+loggers:
+    # ── uvicorn ─────────────────────────────────────────────────────
+    uvicorn:
+        level: INFO
+        propagate: true
+    uvicorn.error:
+        level: INFO
+        propagate: true
+    uvicorn.access:
+        level: INFO
+        propagate: true
+
+    # ── APScheduler ─────────────────────────────────────────────────
+    apscheduler:
+        level: INFO
+        propagate: true
+    apscheduler._schedulers:
+        level: INFO
+        propagate: true
+    apscheduler._schedulers.async_:
+        level: INFO
+        propagate: true
+
+    # ── FastAPI / Starlette ─────────────────────────────────────────
+    fastapi:
+        level: INFO
+        propagate: true
+
+    # ── aiorun ──────────────────────────────────────────────────────
+    aiorun:
+        level: INFO
+        propagate: true
+
+    # ── pyesb-amqp (Rust tracing — через stderr→logging bridge) ────
+    pyesb_amqp:
+        level: INFO
+        propagate: true
+
+    # ── HTTPX (network) ────────────────────────────────────────────
+    httpx:
+        level: WARNING
+        propagate: true
+
+    # ── asyncio ────────────────────────────────────────────────────
+    asyncio:
+        level: WARNING
+        propagate: true
+
+    # ── tzlocal ────────────────────────────────────────────────────
+    tzlocal:
+        level: WARNING
+        propagate: true
+
+    # ── SQLAlchemy ─────────────────────────────────────────────────
+    sqlalchemy:
+        level: WARNING
+        propagate: true
+
+    # ── cashews ────────────────────────────────────────────────────
+    cashews:
+        level: WARNING
+        propagate: true

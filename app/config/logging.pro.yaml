@@ -1,0 +1,49 @@
+version: 1
+disable_existing_loggers: false
+
+formatters:
+    json:
+        (): app.events.JsonlFormatter
+
+handlers:
+    console:
+        class: logging.StreamHandler
+        formatter: json
+        stream: ext://sys.stdout
+
+root:
+    level: WARNING
+    handlers: [console]
+
+loggers:
+    # ── apscheduler (только ошибки — shutdown-логи не нужны) ──
+    apscheduler:
+        level: WARNING
+        propagate: true
+    apscheduler._schedulers:
+        level: WARNING
+        propagate: true
+    apscheduler._schedulers.async_:
+        level: WARNING
+        propagate: true
+
+    # ── aiorun (только ERROR — shutdown-логи WARNING/INFO не нужны) ──
+    aiorun:
+        level: ERROR
+        propagate: true
+
+    # ── pyesb-amqp (Rust tracing — через stderr→logging bridge) ────
+    pyesb_amqp:
+        level: WARNING
+        propagate: true
+
+    # ── Остальное — только ошибки (наследуют root=WARNING) ───────
+    # uvicorn: WARNING (наследует от root)
+    # uvicorn.access: WARNING
+    # uvicorn.error: WARNING
+    # fastapi: WARNING
+    # httpx: WARNING
+    # asyncio: WARNING
+    # tzlocal: WARNING
+    # sqlalchemy: WARNING
+    # cashews: WARNING

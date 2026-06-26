@@ -8,7 +8,7 @@
         schedule_id=schedule_id,
         destination=destination,
         url=url,
-        headers=fmt_headers(headers),
+        headers=headers,
         body_size=body_size,
         body=body,
         timeout=timeout,
@@ -17,7 +17,7 @@
 Поля, общие для нескольких событий, вынесены в базовые классы-примеси
 и переиспользуются через множественное наследование::
 
-    LogEvent                   ← dt, ulid, .emit(), _event_name, _level
+    LogEvent                   ← dt, ulid, .emit(), _level
     ├── ScheduleRef            (schedule_id)
     ├── TargetRef              (destination, url)
     ├── MessageRef             (message_id, trace_id)
@@ -30,24 +30,40 @@
     │   ├── DeliveryFailedEvent        + error, duration_ms
     │   └── DeliveryScheduledEvent     + MessageRef + pause, ttl, end_time
     │
-    ├── DeliverySkippedShutdownEvent = MessageRef + TargetRef
-    ├── ScheduleRemoveSkippedEvent    = ScheduleRef (только schedule_id)
     ├── PayloadReceivedEvent          = MessageRef + TargetRef + ScheduleRef
     │   └── PayloadReceivedAMQPEvent  + 1C audit fields
     │
     └── Остальные — standalone (нет пересечений полей)
+
+Принадлежит модулю ``app.events._schemas``, re-export через ``app.events``.
+Имя события ``event`` в JSON-строке вычисляется автоматически
+из имени класса (``CamelCase → snake_case``, с отрезанным ``Event``).
+
+Для событий без собственных полей используйте ``LogEvent()`` напрямую
+и передайте имя события через параметр ``event`` в ``.emit()``::
+
+    LogEvent().emit(event="service_startup")
+    LogEvent().emit(event="stderr_reader_error", level="error")
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+import re
 from datetime import datetime, timezone
-from typing import Any, ClassVar
+from typing import ClassVar
 
-import structlog
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, NonNegativeInt, PositiveFloat, PositiveInt
 from pydantic.types import PastDatetime
 from ulid import ULID
+
+# ── Lifecycle event names that are skipped in production ────────────────────
+# Bare ``LogEvent().emit(event="service_startup")`` calls use these names.
+_LIFECYCLE_EVENTS: frozenset[str] = frozenset({
+    "service_startup",
+    "shutdown_amqp_stopped",
+    "shutdown_deliveries_resolved",
+    "shutdown_complete",
+})
 
 __all__ = [
     "CircuitBreakerOpenEvent",
@@ -58,7 +74,6 @@ __all__ = [
     "DeliveryHttpErrorEvent",
     "DeliveryResponseEvent",
     "DeliveryScheduledEvent",
-    "DeliverySkippedShutdownEvent",
     "DeliverySuccessEvent",
     "FatalErrorEvent",
     "HandlerFailedEvent",
@@ -67,24 +82,37 @@ __all__ = [
     "PayloadReceivedAMQPEvent",
     "PayloadReceivedEvent",
     "ScheduleRef",
-    "ScheduleRemoveSkippedEvent",
     "SchedulerStartedEvent",
-    "ServiceStartupEvent",
-    "ShutdownAmqpStoppedEvent",
     "ShutdownCancelledEvent",
-    "ShutdownCompleteEvent",
-    "ShutdownDeliveriesCompletedEvent",
-    "ShutdownDeliveriesResolvedEvent",
     "ShutdownTimeoutEvent",
     "ShutdownWaitingEvent",
-    "StderrReaderErrorEvent",
     "TargetRef",
     "UnhandledTaskErrorEvent",
-    "exc_info",
-    "fmt_headers",
 ]
 
-_logger = structlog.get_logger("events")
+
+# ===================================================================
+# Helpers
+# ===================================================================
+
+
+def _event_name_for(cls: type) -> str:
+    """Derive ``"delivery_attempt"`` from ``DeliveryAttemptEvent``.
+
+    Strips trailing ``Event`` suffix, then converts ``CamelCase``
+    to ``snake_case`` (acronym-aware: ``AMQP → amqp``).
+    """
+    name = cls.__name__
+    name = name.removesuffix("Event")
+    # Split on:
+    #   1. lower→upper boundary       (attempt → Attempt)
+    #   2. upper→upper+lower boundary (AMQP → Event)
+    return re.sub(
+        r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])",
+        "_",
+        name,
+    ).lower()
+
 
 # ===================================================================
 # Pydantic models with .emit()
@@ -96,7 +124,7 @@ class LogEvent(BaseModel):
 
     - ``extra='forbid'`` → typo in field name = Pydantic error.
     - ``validate_default=True`` → even defaults are type-checked.
-    - ``.emit()`` → validates, serialises, and sends to structlog.
+    - ``.emit()`` → validates, serialises, and writes to stdout (JSONL).
 
     Каждое событие несёт два обязательных поля:
     * ``dt`` — PastDatetime, метка времени события (автогенерируется).
@@ -116,20 +144,52 @@ class LogEvent(BaseModel):
     )
 
     # Metadata — NOT fields (ClassVar is excluded from model_dump)
-    _event_name: ClassVar[str] = "unknown"
     _level: ClassVar[str] = "info"
+    _prod_skip: ClassVar[bool] = False  # True on lifecycle events, hidden in prod
 
-    def emit(self) -> None:
-        """Validate and log this event through structlog.
+    def emit(
+        self,
+        event: str | None = None,
+        level: str | None = None,
+        **extra: object,
+    ) -> None:
+        """Validate, serialize and write to stdout (JSONL).
 
-        1. ``model_dump(mode='json')`` — сериализует datetime → ISO-8601,
-           ULID → 26-символьная строка.
-        2. Pydantic уже проверил все поля при конструировании.
-        3. Structlog processors добавляют ``level``, ``timestamp``,
-           ``message_id``, ``trace_id`` (через ``_add_context_vars``).
+        1. ``model_dump(mode='json', exclude_none=True)`` — сериализует
+           datetime → ISO-8601, ULID → 26-символьная строка.
+        2. Добавляет ``level`` (из ``_level`` или переданный вручную).
+        3. Добавляет ``event`` (из имени класса или переданный вручную)
+           и ``model`` (имя класса).
+        4. Любые ``**extra`` поля мержатся поверх (для событий без модели).
+        5. ``json.dumps`` + ``os.write(1, …)``.
+
+        **ВНИМАНИЕ:** emit() не трансформирует данные.
+        Никакой PII-маскировки или инжекции context vars здесь нет.
         """
-        log_fn = getattr(_logger, self._level, _logger.info)
-        log_fn(self._event_name, **self.model_dump(mode="json"))
+        import json as json_mod
+        import os
+
+        # Production: skip lifecycle events (startup, shutdown, etc.)
+        if not __debug__:
+            event_name = event if event is not None else _event_name_for(type(self))
+            if self._prod_skip or event_name in _LIFECYCLE_EVENTS:
+                return
+
+        from app.config import settings
+
+        data = self.model_dump(mode="json", exclude_none=True)
+        data["level"] = level if level is not None else self._level
+        data["event"] = event if event is not None else _event_name_for(type(self))
+        data["model"] = type(self).__name__
+        data.update(extra)
+
+        indent = 2 if settings.PRETTY_LOG else None
+        line = json_mod.dumps(data, default=str, indent=indent) + "\n"
+
+        try:
+            os.write(1, line.encode("utf-8", errors="replace"))
+        except OSError:
+            pass
 
 
 # ── Field-group mixins (single source of truth) ────────────────────────
@@ -155,7 +215,7 @@ class MessageRef(LogEvent):
     trace_id: str | None = None
 
 
-# ── Delivery chain (events fired inside ``deliver_payload``) ───────────
+# ── Delivery chain base ────────────────────────────────────────────────
 
 
 class DeliveryEventBase(ScheduleRef, TargetRef):
@@ -165,89 +225,58 @@ class DeliveryEventBase(ScheduleRef, TargetRef):
     pass
 
 
+# ── Delivery chain (events fired inside ``deliver_payload``) ───────────
+
+
 class DeliveryAttemptEvent(DeliveryEventBase):
     """Попытка HTTP POST: тело запроса, размер, таймаут."""
 
-    _event_name: ClassVar[str] = "delivery_attempt"
-    _level: ClassVar[str] = "info"
     headers: list[list[str]] | None = None
-    body_size: int | None = None
+    body_size: NonNegativeInt | None = None
     body: str | None = None
-    timeout: int
+    timeout: PositiveInt | None = None
 
 
 class DeliveryResponseEvent(DeliveryEventBase):
     """HTTP-ответ получен. **Логируется ДО raise_for_status**."""
 
-    _event_name: ClassVar[str] = "delivery_response"
-    _level: ClassVar[str] = "info"
-    status_code: int
-    response_headers: dict[str, str]
+    status_code: int | None = Field(default=None, ge=100, lt=600)
+    response_headers: dict[str, str] | None = None
     response_body: str | None = None
-    duration_ms: int
+    duration_ms: NonNegativeInt | None = None
 
 
 class DeliverySuccessEvent(DeliveryEventBase):
     """Доставка успешна (HTTP 2xx), расписание удаляется."""
 
-    _event_name: ClassVar[str] = "delivery_success"
-    _level: ClassVar[str] = "info"
-    status_code: int
-    duration_ms: int
+    status_code: int | None = Field(default=None, ge=100, lt=600)
+    duration_ms: NonNegativeInt | None = None
 
 
 class DeliveryHttpErrorEvent(DeliveryEventBase):
     """Целевой сервер вернул HTTP-ошибку (4xx/5xx). Будет повтор."""
 
-    _event_name: ClassVar[str] = "delivery_http_error"
-    _level: ClassVar[str] = "warning"
-    status_code: int
-    error: str
+    status_code: int | None = Field(default=None, ge=100, lt=600)
+    error: str | None = None
 
 
 class DeliveryFailedEvent(DeliveryEventBase):
     """Сетевая ошибка / таймаут. Будет повтор."""
 
-    _event_name: ClassVar[str] = "delivery_failed"
-    _level: ClassVar[str] = "error"
-    error: str
-    duration_ms: int | None = None
+    error: str | None = None
+    duration_ms: NonNegativeInt | None = None
 
 
-class DeliveryScheduledEvent(DeliveryEventBase, MessageRef):
+class DeliveryScheduledEvent(MessageRef, DeliveryEventBase):
     """Создано APScheduler-расписание с IntervalTrigger.
 
-    Наследует schedule_id, destination, url от DeliveryEventBase
-    и message_id, trace_id от MessageRef.
+    Наследует message_id, trace_id от MessageRef
+    и schedule_id, destination, url от DeliveryEventBase.
     """
 
-    _event_name: ClassVar[str] = "delivery_scheduled"
-    _level: ClassVar[str] = "info"
-    pause: int
-    ttl: int
-    end_time: str
-
-
-class DeliverySkippedShutdownEvent(MessageRef, TargetRef):
-    """Доставка пропущена — приложение выключается (``_shutting_down``).
-
-    Все поля (message_id, trace_id, destination, url) — от предков.
-    """
-
-    _event_name: ClassVar[str] = "delivery_skipped_shutdown"
-    _level: ClassVar[str] = "warning"
-    pass
-
-
-class ScheduleRemoveSkippedEvent(ScheduleRef):
-    """Расписание уже удалено (гонка при remove_schedule).
-
-    Единственное поле schedule_id — от ScheduleRef.
-    """
-
-    _event_name: ClassVar[str] = "schedule_remove_skipped"
-    _level: ClassVar[str] = "debug"
-    pass
+    pause: NonNegativeInt | None = None
+    ttl: NonNegativeInt | None = None
+    end_time: str | None = None
 
 
 # ── Payload received ──────────────────────────────────────────────────
@@ -261,12 +290,10 @@ class PayloadReceivedEvent(MessageRef, TargetRef, ScheduleRef):
     schedule_id               → ScheduleRef
     """
 
-    _event_name: ClassVar[str] = "payload_received"
-    _level: ClassVar[str] = "info"
     headers: list[list[str]] | None = None
-    timeout: int
-    pause: int
-    ttl: int
+    timeout: PositiveInt | None = None
+    pause: NonNegativeInt | None = None
+    ttl: NonNegativeInt | None = None
 
 
 class PayloadReceivedAMQPEvent(PayloadReceivedEvent):
@@ -277,25 +304,28 @@ class PayloadReceivedAMQPEvent(PayloadReceivedEvent):
     доставки со стороны брокера (не путать с retry-циклом webhooker'а).
     """
 
-    _event_name: ClassVar[str] = "payload_received"
-    _level: ClassVar[str] = "info"
     correlation_id: str | None = None
     sender_code: str | None = None
     recipient_code: str | None = None
-    integ_message_id: str
-    delivery_count: int
+    integ_message_id: str | None = None
+    delivery_count: NonNegativeInt | None = None
 
 
 # ── Handler / Errors ──────────────────────────────────────────────────
 
 
 class HandlerFailedEvent(LogEvent):
-    """Ошибка парсинга AMQP-сообщения, сообщение отклонено."""
+    """Ошибка парсинга AMQP-сообщения, сообщение отклонено.
 
-    _event_name: ClassVar[str] = "handler_failed"
+    Содержит ``body_preview`` (первые N байт сырого тела) и ``body_size``
+    для диагностики того, что именно прислала 1С.
+    """
+
     _level: ClassVar[str] = "error"
     destination: str
     error: str
+    body_size: NonNegativeInt | None = None
+    body_preview: str | None = None
 
 
 # ── Scheduler ─────────────────────────────────────────────────────────
@@ -304,9 +334,8 @@ class HandlerFailedEvent(LogEvent):
 class SchedulerStartedEvent(LogEvent):
     """APScheduler запущен в фоне."""
 
-    _event_name: ClassVar[str] = "scheduler_started"
-    _level: ClassVar[str] = "info"
-    max_concurrent: int
+    _prod_skip: ClassVar[bool] = True
+    max_concurrent: PositiveInt
 
 
 # ── Shutdown ──────────────────────────────────────────────────────────
@@ -315,82 +344,30 @@ class SchedulerStartedEvent(LogEvent):
 class ShutdownWaitingEvent(LogEvent):
     """Ожидание завершения активных HTTP-доставок."""
 
-    _event_name: ClassVar[str] = "shutdown: waiting_for_deliveries"
-    _level: ClassVar[str] = "info"
-    count: int
-    timeout: float
+    _prod_skip: ClassVar[bool] = True
+    count: NonNegativeInt
+    timeout: PositiveFloat
 
 
 class ShutdownTimeoutEvent(LogEvent):
     """Таймаут ожидания — ``remaining`` задач не завершились."""
 
-    _event_name: ClassVar[str] = "shutdown: deliveries_timeout"
-    _level: ClassVar[str] = "warning"
-    remaining: int
-    timeout: float
+    _prod_skip: ClassVar[bool] = True
+    remaining: NonNegativeInt
+    timeout: PositiveFloat
 
 
 class ShutdownCancelledEvent(LogEvent):
     """Зависшие доставки принудительно отменены."""
 
-    _event_name: ClassVar[str] = "shutdown: deliveries_cancelled"
-    _level: ClassVar[str] = "info"
-    count: int
-
-
-class ShutdownAmqpStoppedEvent(LogEvent):
-    """AMQP-транспорт остановлен; ``_shutting_down = True``."""
-
-    _event_name: ClassVar[str] = "shutdown: amqp_stopped"
-    _level: ClassVar[str] = "info"
-    pass
-
-
-class ShutdownDeliveriesResolvedEvent(LogEvent):
-    """Все in-flight задачи разрешены — можно останавливать APScheduler."""
-
-    _event_name: ClassVar[str] = "shutdown: deliveries_resolved"
-    _level: ClassVar[str] = "info"
-    pass
-
-
-class ShutdownDeliveriesCompletedEvent(LogEvent):
-    """Все активные доставки завершились штатно."""
-
-    _event_name: ClassVar[str] = "shutdown: deliveries_completed"
-    _level: ClassVar[str] = "info"
-    pass
-
-
-class ServiceStartupEvent(LogEvent):
-    """Приложение запущено, lifespan начался."""
-
-    _event_name: ClassVar[str] = "service_startup"
-    _level: ClassVar[str] = "info"
-    pass
-
-
-class ShutdownCompleteEvent(LogEvent):
-    """Все компоненты остановлены, приложение завершило работу."""
-
-    _event_name: ClassVar[str] = "shutdown: complete"
-    _level: ClassVar[str] = "info"
-    pass
-
-
-class StderrReaderErrorEvent(LogEvent):
-    """Неожиданная ошибка в stderr-reader (Rust tracing pyesb-amqp), перезапуск."""
-
-    _event_name: ClassVar[str] = "stderr_to_jsonl_error, restarting"
-    _level: ClassVar[str] = "exception"
-    pass
+    _prod_skip: ClassVar[bool] = True
+    count: NonNegativeInt
 
 
 class FatalErrorEvent(LogEvent):
     """Фатальная ошибка при запуске приложения."""
 
-    _event_name: ClassVar[str] = "fatal_error"
-    _level: ClassVar[str] = "exception"
+    _level: ClassVar[str] = "critical"
     error: str
 
 
@@ -401,8 +378,7 @@ class UnhandledTaskErrorEvent(LogEvent):
     в обёртке ``safe_create_task._wrapped()``.
     """
 
-    _event_name: ClassVar[str] = "unhandled_task_error"
-    _level: ClassVar[str] = "exception"
+    _level: ClassVar[str] = "error"
     task_name: str | None = None
 
 
@@ -419,52 +395,24 @@ class CircuitBreakerOpenEvent(DeliveryEventBase):
     если TTL истёк, а сервер всё ещё недоступен).
     """
 
-    _event_name: ClassVar[str] = "circuit_breaker_open"
     _level: ClassVar[str] = "warning"
     error: str
 
 
-class DeliveryExpiredEvent(ScheduleRef, TargetRef, MessageRef):
+class DeliveryExpiredEvent(MessageRef, DeliveryEventBase):
     """Доставка окончательно провалена — исчерпан TTL.
 
     Все retry-попытки по IntervalTrigger закончились,
     целевой сервер так и не ответил 2xx.
     Это аналог Dead Letter Queue (DLQ) — сообщение требует
     ручного анализа.
+
+    message_id + trace_id → MessageRef
+    schedule_id           → ScheduleRef
+    destination + url     → TargetRef
     """
 
-    _event_name: ClassVar[str] = "delivery_expired"
     _level: ClassVar[str] = "warning"
-    pause: int
-    ttl: int
-    error: str | None = None
-    attempts: int | None = None
-
-
-# ===================================================================
-# Helpers
-# ===================================================================
-
-
-def fmt_headers(
-    headers: Iterable[tuple[str, str]] | None,
-) -> list[list[str]] | None:
-    """Convert ``[(k, v), …]`` to ``[[k, v], …]`` for JSON logging.
-
-    Public helper — call before passing to any model with ``headers`` field::
-
-        DeliveryAttemptEvent(
-            headers=fmt_headers(raw_headers),
-            ...
-        ).emit()
-    """
-    if headers is None:
-        return None
-    return [list(h) for h in headers]
-
-
-def exc_info() -> dict[str, Any]:
-    """Return current exception info (for manual ``logger.exception`` calls)."""
-    import sys
-
-    return {"exc_info": sys.exc_info()}
+    attempt_count: NonNegativeInt
+    pause: NonNegativeInt
+    ttl: NonNegativeInt

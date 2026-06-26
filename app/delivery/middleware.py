@@ -5,13 +5,6 @@ Each middleware wraps the delivery call with ``before()`` and ``after()`` hooks:
 
     Before chain:  M1.before → M2.before → … → HTTP POST
     After chain:   … → M2.after → M1.after   (reverse order)
-
-Usage::
-
-    from app.middleware import MiddlewarePipeline, LoggingMiddleware
-
-    pipeline = MiddlewarePipeline(middlewares=[LoggingMiddleware()])
-    await pipeline.run(ctx, http_call)
 """
 
 from __future__ import annotations
@@ -21,6 +14,8 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from app.config import settings
+
 __all__ = [
     "DeliveryContext",
     "MetricsMiddleware",
@@ -29,15 +24,12 @@ __all__ = [
     "duration_buckets",
 ]
 
-# Duration buckets for histogram (in milliseconds)
-duration_buckets: list[int] = [10, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 30000]
+# Duration buckets for histogram (in milliseconds) — from app.config.settings
+duration_buckets: list[int] = list(settings.DURATION_BUCKETS_MS)
 
 
 class DeliveryContext:
-    """Context object passed through the middleware chain.
-
-    Populated before delivery, updated by middlewares and the HTTP call.
-    """
+    """Context object passed through the middleware chain."""
 
     def __init__(
         self,
@@ -60,7 +52,6 @@ class DeliveryContext:
         self.schedule_id = schedule_id
         self.trace_id = trace_id
 
-        # Filled during delivery
         self.start_time: float = time.monotonic()
         self.duration_ms: int | None = None
         self.status_code: int | None = None
@@ -70,28 +61,17 @@ class DeliveryContext:
 
 
 class Middleware(abc.ABC):
-    """Base class for delivery middleware.
-
-    Subclasses override ``before()`` and/or ``after()``.
-    Both hooks are optional (no-op by default).
-    """
+    """Base class for delivery middleware."""
 
     async def before(self, ctx: DeliveryContext) -> None:  # noqa: B027
         """Called before the HTTP POST. May modify ``ctx`` or raise."""
 
     async def after(self, ctx: DeliveryContext) -> None:  # noqa: B027
-        """Called after the HTTP POST (success or failure).
-
-        ``ctx.error`` is set if the call failed.
-        """
+        """Called after the HTTP POST (success or failure)."""
 
 
 class MiddlewarePipeline:
-    """Chain of middlewares that wrap a delivery call.
-
-    Middlewares are called in order for ``before()`` and in reverse
-    order for ``after()``, forming an onion-like wrapper.
-    """
+    """Chain of middlewares that wrap a delivery call."""
 
     def __init__(self, middlewares: list[Middleware] | None = None) -> None:
         self._middlewares = list(middlewares or [])
@@ -105,49 +85,23 @@ class MiddlewarePipeline:
         ctx: DeliveryContext,
         call: Callable[[], Awaitable[Any]],
     ) -> None:
-        """Execute the middleware chain around *call*.
-
-        Args:
-            ctx: The delivery context (shared across middlewares).
-            call: The actual HTTP POST callable.
-
-        Raises:
-            Any exception from ``call`` after middlewares have processed it.
-        """
-        # Before chain (forward order)
+        """Execute the middleware chain around *call*."""
         for m in self._middlewares:
             await m.before(ctx)
 
-        # Actual call
         try:
             await call()
         except Exception as exc:
             ctx.error = exc
             raise
         finally:
-            # After chain (reverse order — onion model)
             ctx.duration_ms = int((time.monotonic() - ctx.start_time) * 1000)
             for m in reversed(self._middlewares):
                 await m.after(ctx)
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Built-in middlewares
-# ═══════════════════════════════════════════════════════════════════════
-
-
 class MetricsMiddleware(Middleware):
-    """Collect in-memory delivery metrics.
-
-    Access via ``MetricsMiddleware.stats``::
-
-        metrics = MetricsMiddleware()
-        pipeline = MiddlewarePipeline(middlewares=[metrics])
-        ...
-        print(metrics.stats)
-
-    Values are reset on process restart (in-memory only).
-    """
+    """Collect in-memory delivery metrics."""
 
     def __init__(self) -> None:
         self.total_attempts: int = 0
@@ -155,11 +109,10 @@ class MetricsMiddleware(Middleware):
         self.failure_count: int = 0
         self.total_duration_ms: int = 0
         self._duration_buckets: list[int] = duration_buckets
-        self._duration_histogram: dict[int, int] = {b: 0 for b in duration_buckets}
+        self._duration_histogram: dict[int, int] = dict.fromkeys(duration_buckets, 0)
 
     @property
     def stats(self) -> dict[str, Any]:
-        """Return current aggregated metrics."""
         return {
             "total_attempts": self.total_attempts,
             "success_count": self.success_count,
