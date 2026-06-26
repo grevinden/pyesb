@@ -60,6 +60,6 @@ def first_str(val: str | list[str] | None) -> str | None:
 
 # Публичный экспорт для удобства импорта
 __all__ = [
-    "resolve_trace_id",
     "first_str",
+    "resolve_trace_id",
 ]

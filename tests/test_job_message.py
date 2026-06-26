@@ -9,7 +9,7 @@ import pytest
 from pydantic import ValidationError
 from pyesb_amqp import E1CMessage
 
-from app.main import Message, PayloadSchema
+from app.models import Message, PayloadSchema
 
 
 def make_payload_bytes(

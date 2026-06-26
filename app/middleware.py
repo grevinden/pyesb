@@ -21,6 +21,17 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+__all__ = [
+    "DeliveryContext",
+    "MetricsMiddleware",
+    "Middleware",
+    "MiddlewarePipeline",
+    "duration_buckets",
+]
+
+# Duration buckets for histogram (in milliseconds)
+duration_buckets: list[int] = [10, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 30000]
+
 
 class DeliveryContext:
     """Context object passed through the middleware chain.
@@ -143,6 +154,8 @@ class MetricsMiddleware(Middleware):
         self.success_count: int = 0
         self.failure_count: int = 0
         self.total_duration_ms: int = 0
+        self._duration_buckets: list[int] = duration_buckets
+        self._duration_histogram: dict[int, int] = {b: 0 for b in duration_buckets}
 
     @property
     def stats(self) -> dict[str, Any]:
@@ -152,10 +165,9 @@ class MetricsMiddleware(Middleware):
             "success_count": self.success_count,
             "failure_count": self.failure_count,
             "avg_duration_ms": (
-                self.total_duration_ms // self.total_attempts
-                if self.total_attempts
-                else 0
+                self.total_duration_ms // self.total_attempts if self.total_attempts else 0
             ),
+            "duration_histogram": self._duration_histogram.copy(),
         }
 
     async def before(self, ctx: DeliveryContext) -> None:
@@ -171,3 +183,7 @@ class MetricsMiddleware(Middleware):
 
         if ctx.duration_ms is not None:
             self.total_duration_ms += ctx.duration_ms
+            for b in self._duration_buckets:
+                if ctx.duration_ms <= b:
+                    self._duration_histogram[b] += 1
+                    break

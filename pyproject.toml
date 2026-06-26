@@ -14,7 +14,6 @@ dependencies = [
     "pyyaml>=6.0.1",
     "apscheduler>=4.0.0a6",
     "httpx>=0.28.1",
-    "sniffio>=1.3.1",
     "aiorun>=2025.1.1",
     "python-ulid>=3.1.0",
 ]
@@ -39,7 +38,9 @@ pythonpath = ["."]
 
 [dependency-groups]
 dev = [
-    "icecream>=2.2.0",
+    "ruff>=0.5.0",
+    "mypy>=1.10.0",
+    "pre-commit>=3.5.0",
 ]
 test = [
     "asgi-lifespan>=2.1.0",
@@ -47,5 +48,126 @@ test = [
     "pytest-asyncio>=1.4.0",
 ]
 
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    # Format: trailing comma — conflicts with formatter
+    "COM812",
+    # Docstring rules (Russian docs intentionally don't follow English conventions)
+    "D100", "D101", "D102", "D103", "D104", "D105", "D107",
+    "D203", "D212", "D213", "D400", "D415",
+    # Package
+    "INP001",  # app/ has __init__.py
+    # Exceptions
+    "EM101", "EM102",  # string/f-string exceptions — okay for small codebase
+    "BLE001",  # blind Exception catch — intentional in many places
+    # Booleans
+    "FBT001", "FBT002",  # boolean positional args — apscheduler compat
+    # Magic numbers
+    "PLR2004",
+    # Function complexity
+    "PLR0913", "PLR0915",  # too many args/statements — deliver_payload signature
+    # Unicode (Russian comments are intentional)
+    "RUF001", "RUF002", "RUF003",
+    # Mutable class vars
+    "RUF012",
+    # Misc
+    "PGH003",  # specific rule codes
+    "TD003",   # TODO issue link
+    "SLF001",  # private member access
+    "FA100",   # from __future__ import annotations — already used
+    "PLW0603",  # global statements — intentional module-level pattern
+    "S104",     # bind to all interfaces — intentional dev default
+    "S501",     # verify=False — customer requirement
+    "UP017",    # datetime.UTC alias — pre-existing, Python 3.11+
+    "ASYNC109", # timeout parameter name — not asyncio.timeout
+    "RUF059",   # unused variable in tuple unpack
+    "S101",     # assert — intentional in delivery.py
+    "PIE790",   # unnecessary pass — pre-existing in events.py
+    "ARG001",   # unused function arg — structlog processor signature
+    "B024",     # abstract base class — Middleware is intentionally abstract
+    "PLC0415",  # import inside function — lazy import avoids circular deps
+    "TRY300",   # else block style — pre-existing
+    "RUF100",   # unused noqa — pre-existing
+    "SIM105",   # suppress pattern — pre-existing
+    "UP043",    # unnecessary type args — pre-existing
+    "TC001", "TC002", "TC003",  # TYPE_CHECKING imports — pre-existing
+    "D205", "D209", "D401",  # docstring style — Russian docs
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = [
+    "S101",    # assert in tests
+    "ANN001", "ANN201",  # type annotations
+    "D100", "D101", "D102", "D103", "D104", "D107",  # docstrings
+    "SLF001",  # private member access
+    "PLR2004", # magic value
+    "S113",    # request_call_without_timeout
+    "BLE001",  # blind Exception catch
+    "PLR0913", "PLR0915",  # function complexity
+    "RUF059",  # unused unpacked variable
+    "FBT001", "FBT002",  # boolean positional args
+    "ARG002",  # unused ctx arg in middleware hooks
+    "B006",    # mutable default arg in test helper
+    "D403",    # docstring first word capitalization (Russian)
+    "PT012",   # pytest.raises multi-statement
+    "ERA001",  # commented-out code
+    "RET504",  # unnecessary assignment before return
+    "D413",    # blank line after section
+    "C420",    # dict.fromkeys
+    "D415",    # docstring punctuation
+]
+"app/delivery.py" = [
+    "S101",     # assert current_task — intentional invariant check
+    "PLC0415",  # lazy import json — performance (only on demand)
+    "PLR0913", "PLR0915",  # APScheduler callback signature
+]
+"app/lifespan.py" = [
+    "PLC0415",  # lazy imports to avoid circular deps
+    "TRY300",   # return in try block — amqp_handler style
+]
+"app/log.py" = [
+    "PLC0415",  # lazy imports (json, ULID) — only on demand
+    "ARG001",   # structlog processor signature (logger, method_name required)
+    "SIM105",   # try/except CancelledError — intentional
+]
+"app/main.py" = [
+    "PLC0415",  # lazy import create_delivery_schedule
+    "TC001",    # PayloadSchema used at runtime in endpoint
+]
+"app/events.py" = [
+    "PIE790",   # unnecessary pass in event classes — pre-existing style
+    "PLC0415",  # lazy import sys in exc_info()
+    "TC002", "TC003",  # TYPE_CHECKING imports
+    "D205", "D209",  # docstring style
+]
+"app/middleware.py" = [
+    "B024",     # Middleware is intentionally abstract (no abstract methods)
+    "TC003",    # TYPE_CHECKING imports
+    "D401",     # docstring mood
+    "D413",     # blank line after section
+    "C420",     # dict.fromkeys — explicit comprehension is clearer
+    "ARG002",   # unused ctx arg — middleware hook signature
+]
+"app/tasks.py" = [
+    "PLC0415",  # lazy import events
+    "D413",     # blank line after section
+    "RET504",   # unnecessary assignment before return
+]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_unused_ignores = true
+ignore_missing_imports = true
+exclude = ["tests/"]
+
+[tool.ruff.format]
+preview = true
+
 [tool.uv.sources]
-pyesb-amqp = { git = "https://github.com/grevinden/pyesb-amqp.git" }
+pyesb-amqp = { git = "https://github.com/grevinden/pyesb-amqp.git", rev = "4521c416ab3e8cfc50ab9c3b1851fc154592de28" }

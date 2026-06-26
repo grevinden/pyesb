@@ -1,0 +1,13 @@
+.git/
+.gitignore
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+.zed/
+.threadbridge/
+*.md
+tests/
+data.db
+process.log

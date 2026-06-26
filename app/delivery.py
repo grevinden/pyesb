@@ -50,6 +50,41 @@ _delivery_semaphore: asyncio.Semaphore = asyncio.Semaphore(
 * размера пула соединений ``httpx``.
 """
 
+# ── Shared httpx client ──────────────────────────────────────────────
+# Один AsyncClient на все HTTP-доставки — пул соединений,
+# не создаём клиент на каждый запрос (C2 performance fix).
+_http_client: httpx.AsyncClient | None = None
+"""Lazily initialized shared HTTP client. Close via ``close_http_client()``."""
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    """Return the shared httpx.AsyncClient, creating it if needed.
+
+    Client is configured with connection pool limits from settings.
+    """
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(
+            limits=httpx.Limits(
+                max_connections=settings.MAX_CONCURRENT_DELIVERIES,
+                max_keepalive_connections=settings.MAX_CONCURRENT_DELIVERIES,
+            ),
+            verify=False,  # Требование заказчика: отключить проверку SSL-сертификата
+        )
+    return _http_client
+
+
+async def close_http_client() -> None:
+    """Close the shared httpx.AsyncClient.
+
+    Call during shutdown (lifespan) to release connection pool resources.
+    """
+    global _http_client
+    if _http_client is not None:
+        await _http_client.aclose()
+        _http_client = None
+
+
 # ── Shutdown guard ───────────────────────────────────────────────────
 # Множество asyncio.Task-ов, которые сейчас выполняют HTTP-запрос.
 # Используется в lifespan для ожидания завершения доставок.
@@ -113,7 +148,9 @@ async def deliver_payload(
     schedule_id: str = job.schedule_id if job.schedule_id is not None else "unknown"
 
     headers_dict = dict(headers) if headers else {}
-    body_repr = _truncate_json(body, _MAX_BODY_CHARS)
+    # json.dumps в _truncate_json / _json_size — тяжёлые операции,
+    # выносим в asyncio.to_thread (H1 fix).
+    body_repr = await asyncio.to_thread(_truncate_json, body, _MAX_BODY_CHARS)
 
     # Регистрируемся как in-flight — shutdown будет ждать нас
     current_task = asyncio.current_task()
@@ -125,12 +162,13 @@ async def deliver_payload(
 
     try:
         # ── delivery_attempt ──────────────────────────────────────────
+        body_size = await asyncio.to_thread(_json_size, body)
         DeliveryAttemptEvent(
             schedule_id=schedule_id,
             destination=destination,
             url=url,
             headers=fmt_headers(headers),
-            body_size=_json_size(body),
+            body_size=body_size,
             body=body_repr,
             timeout=timeout,
         ).emit()
@@ -147,14 +185,25 @@ async def deliver_payload(
 
         # ── HTTP POST (защищённый от отмены) ──────────────────────────
         t0 = datetime.now(timezone.utc)
-        timeout_cfg = httpx.Timeout(timeout)
 
         async def _http_post() -> httpx.Response:
-            """Собственно HTTP-вызов. ``shutdown_waits_for`` гарантирует,
+            """Собственно HTTP-вызов через shared клиент.
+
+            Таймаут передаётся на уровне запроса (не клиента),
+            чтобы один shared client обслуживал запросы с разными
+            таймаутами.
+
+            ``shutdown_waits_for`` гарантирует,
             что этот таск не будет отменён даже при CancelledError
-            в нашем APScheduler-контейнере."""
-            async with httpx.AsyncClient(timeout=timeout_cfg) as client:
-                return await client.post(url, json=body, headers=headers_dict)
+            в нашем APScheduler-контейнере.
+            """
+            client = _get_http_client()
+            return await client.post(
+                url,
+                json=body,
+                headers=headers_dict,
+                timeout=timeout,
+            )
 
         try:
             # shutdown_waits_for создаёт независимый таск,
@@ -230,6 +279,9 @@ async def deliver_payload(
             except (LookupError, Exception):
                 ScheduleRemoveSkippedEvent(schedule_id=schedule_id).emit()
 
+        # Cleanup DLQ tracking — задача выполнена (C3 memory leak fix)
+        _cleanup_schedule_tracking(schedule_id)
+
     finally:
         _in_flight.discard(current_task)
         if semaphore_acquired:
@@ -242,13 +294,13 @@ async def deliver_payload(
 
 
 async def wait_for_in_flight(timeout: float | None = None) -> None:
-    if timeout is None:
-        timeout = float(settings.SHUTDOWN_TIMEOUT)
     """Дождаться завершения всех in-flight доставок.
 
     Вызывается из shutdown-последовательности **до** того как
     APScheduler остановит свои task group-и.
     """
+    if timeout is None:
+        timeout = float(settings.SHUTDOWN_TIMEOUT)
     if not _in_flight:
         return
     ShutdownWaitingEvent(count=len(_in_flight), timeout=timeout).emit()
@@ -330,6 +382,16 @@ async def create_delivery_schedule(
 # ---------------------------------------------------------------------------
 
 
+def _cleanup_schedule_tracking(schedule_id: str) -> None:
+    """Clean up DLQ tracking data for a completed schedule.
+
+    Вызывается при успешной доставке. Предотвращает утечку памяти
+    (C3 fix: ``_schedule_end_times`` и ``_attempt_counts``).
+    """
+    _schedule_end_times.pop(schedule_id, None)
+    _attempt_counts.pop(schedule_id, None)
+
+
 def _check_permanent_failure(
     schedule_id: str,
     message_id: str,
@@ -342,6 +404,8 @@ def _check_permanent_failure(
     Вызывается из error-handler'ов ``deliver_payload`` перед ``return``.
     Если ``end_time`` в прошлом, а HTTP всё ещё не 2xx — это permanent
     failure (аналог DLQ).
+
+    На DLQ также чистим tracking (C3 memory leak fix).
     """
     from .events import DeliveryExpiredEvent
 
@@ -362,6 +426,9 @@ def _check_permanent_failure(
         ttl=0,
         attempts=attempts,
     ).emit()
+
+    # Cleanup: задача завершена (DLQ), чистим tracking (C3)
+    _cleanup_schedule_tracking(schedule_id)
 
 
 def _short_exc(exc: Exception) -> str:

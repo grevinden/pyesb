@@ -15,6 +15,10 @@ import asyncio
 
 from app.events import UnhandledTaskErrorEvent
 
+__all__ = [
+    "safe_create_task",
+]
+
 
 def safe_create_task(
     coro: asyncio.Future[object] | asyncio.Task[object],

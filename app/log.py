@@ -164,6 +164,48 @@ async def stderr_to_jsonl(r_fd: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# structlog processor: mask sensitive headers before serialization
+# ---------------------------------------------------------------------------
+
+
+# Sensitive header names to mask in logs (case-insensitive)
+_SENSITIVE_HEADERS: frozenset[str] = frozenset({
+    "authorization",
+    "x-api-key",
+    "cookie",
+    "set-cookie",
+    "x-auth-token",
+    "proxy-authorization",
+})
+
+
+def _sanitize_headers(
+    logger: structlog.stdlib.BoundLogger,
+    method_name: str,
+    event_dict: MutableMapping[str, object],
+) -> MutableMapping[str, object]:
+    """Mask sensitive header values in log events.
+
+    Заменяет значения заголовков ``Authorization``, ``X-Api-Key``,
+    ``Cookie`` и др. на ``"***"`` — прямо в event_dict перед
+    сериализацией в JSON.
+
+    Это **не** меняет API или модель событий — только вывод в лог.
+    """
+    for key in ("headers", "response_headers"):
+        headers = event_dict.get(key)
+        if isinstance(headers, dict):
+            event_dict[key] = {
+                k: ("***" if k.lower() in _SENSITIVE_HEADERS else v) for k, v in headers.items()
+            }
+        elif isinstance(headers, list):
+            event_dict[key] = [
+                [k, "***" if k.lower() in _SENSITIVE_HEADERS else v] for k, v in headers
+            ]
+    return event_dict
+
+
+# ---------------------------------------------------------------------------
 # structlog processor: inject message_id from contextvars
 # ---------------------------------------------------------------------------
 
@@ -295,6 +337,7 @@ def load_logging_config() -> None:
             structlog.processors.TimeStamper(fmt="iso"),
             structlog.processors.StackInfoRenderer(),
             structlog.dev.set_exc_info,
+            _sanitize_headers,  # mask sensitive headers in logs
             _add_context_vars,  # inject message_id, trace_id from contextvars
             # wrap_for_formatter — финальный процессор для structlog-записей.
             # Он преобразует event_dict в строку и кладёт её в LogRecord.msg.

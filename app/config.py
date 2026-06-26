@@ -57,4 +57,4 @@ class Settings:
 # Module-level singleton (import once → frozen dataclass)
 settings = Settings()
 
-__all__ = ["settings", "Settings"]
+__all__ = ["Settings", "settings"]
