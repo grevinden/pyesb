@@ -158,8 +158,7 @@ class LogEvent(BaseModel):
         1. ``model_dump(mode='json', exclude_none=True)`` — сериализует
            datetime → ISO-8601, ULID → 26-символьная строка.
         2. Добавляет ``level`` (из ``_level`` или переданный вручную).
-        3. Добавляет ``event`` (из имени класса или переданный вручную)
-           и ``model`` (имя класса).
+        3. Добавляет ``model`` (имя класса) и ``event``, если передан явно.
         4. Любые ``**extra`` поля мержатся поверх (для событий без модели).
         5. ``json.dumps`` + ``os.write(1, …)``.
 
@@ -179,8 +178,9 @@ class LogEvent(BaseModel):
 
         data = self.model_dump(mode="json", exclude_none=True)
         data["level"] = level if level is not None else self._level
-        data["event"] = event if event is not None else _event_name_for(type(self))
         data["model"] = type(self).__name__
+        if event is not None:
+            data["event"] = event
         data.update(extra)
 
         indent = 2 if settings.PRETTY_LOG else None
@@ -231,7 +231,7 @@ class DeliveryEventBase(ScheduleRef, TargetRef):
 class DeliveryAttemptEvent(DeliveryEventBase):
     """Попытка HTTP POST: тело запроса, размер, таймаут."""
 
-    headers: list[list[str]] | None = None
+    headers: list[tuple[str, str]] | None = None
     body_size: NonNegativeInt | None = None
     body: str | None = None
     timeout: PositiveInt | None = None
@@ -290,10 +290,11 @@ class PayloadReceivedEvent(MessageRef, TargetRef, ScheduleRef):
     schedule_id               → ScheduleRef
     """
 
-    headers: list[list[str]] | None = None
+    headers: set[tuple[str, str]] | None = None
     timeout: PositiveInt | None = None
     pause: NonNegativeInt | None = None
     ttl: NonNegativeInt | None = None
+    schedule_id: str | None = None  # type: ignore[assignment]
 
 
 class PayloadReceivedAMQPEvent(PayloadReceivedEvent):

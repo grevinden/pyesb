@@ -28,7 +28,6 @@ from app.config import bootstrap, settings
 from app.config._database import close_db, get_engine
 
 from .delivery.client import close_http_client
-from .delivery.middleware import MetricsMiddleware
 from .delivery.semaphore import set_shutting_down, wait_for_in_flight
 from .events import (
     LogEvent,
@@ -53,8 +52,6 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     """
     bootstrap()
     LogEvent().emit(event="service_startup")
-
-    metrics = MetricsMiddleware()
 
     @asynccontextmanager
     async def _shutdown_guard() -> AsyncGenerator[None, None]:
@@ -87,7 +84,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
         await exit_stack.enter_async_context(stderr_redirect_lifespan())
         await exit_stack.enter_async_context(AmqpServer(handler=amqp_handler))
 
-        # ── 5. Фиксируем scheduler и metrics в app.state ───────────────
+        # ── 5. Фиксируем scheduler в app.state ────────────────────────
         # Используем module-level app (oidc_add_routes wrapper),
         # т.к. request.app при обращении из эндпоинта — это враппер,
         # а не оригинальный FastAPI (_app).
@@ -96,7 +93,6 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
         )
 
         app.state.scheduler = scheduler
-        app.state.metrics = metrics
         yield
 
     # ── После выхода из стека: scheduler остановлен ────────────────────

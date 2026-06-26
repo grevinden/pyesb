@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
-from apscheduler import CoalescePolicy
+from apscheduler import AsyncScheduler, CoalescePolicy
 from apscheduler.triggers.interval import IntervalTrigger
 
 from app.delivery.engine import deliver_payload
@@ -19,7 +19,7 @@ __all__ = [
 
 
 async def create_delivery_schedule(
-    scheduler: object,
+    scheduler: AsyncScheduler,
     *,
     destination: str,
     url: str,

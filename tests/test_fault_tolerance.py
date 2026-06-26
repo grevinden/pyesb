@@ -5,7 +5,6 @@
 2. MiddlewarePipeline выполняет after() даже при исключении.
 3. safe_create_task логирует и пробрасывает исключения.
 4. Shutdown: _shutting_down блокирует новые доставки.
-5. MetricsMiddleware корректно считает success/failure в pipeline.
 """
 
 from __future__ import annotations
@@ -17,7 +16,6 @@ import pytest
 
 from app.delivery.middleware import (
     DeliveryContext,
-    MetricsMiddleware,
     Middleware,
     MiddlewarePipeline,
 )
@@ -259,94 +257,3 @@ class TestShutdownFlow:
         """wait_for_in_flight не падает при пустом _in_flight."""
         await wait_for_in_flight(timeout=1)
         # Функция просто возвращается, ничего не делая
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# 5. MetricsMiddleware — интеграция с pipeline
-# ═══════════════════════════════════════════════════════════════════════
-
-
-class TestMetricsPipelineIntegration:
-    """MetricsMiddleware корректно считает при реальном pipeline."""
-
-    async def test_metrics_after_success_and_failure(self) -> None:
-        """MetricsMiddleware отслеживает успехи и ошибки."""
-        metrics = MetricsMiddleware()
-        pipeline = MiddlewarePipeline([metrics])
-
-        # Успешная доставка
-        ctx_ok = DeliveryContext(
-            message_id="metrics-001",
-            destination="test",
-            url="http://example.com/ok",
-            timeout=10,
-            schedule_id="sched-metrics-001",
-        )
-
-        async def success() -> None:
-            ctx_ok.status_code = 200
-
-        await pipeline.run(ctx_ok, success)
-
-        # Ошибочная доставка (исключение)
-        ctx_fail = DeliveryContext(
-            message_id="metrics-002",
-            destination="test",
-            url="http://example.com/fail",
-            timeout=10,
-            schedule_id="sched-metrics-002",
-        )
-
-        async def failure() -> None:
-            msg = "http failure"
-            raise ConnectionRefusedError(msg)
-
-        with pytest.raises(ConnectionRefusedError):
-            await pipeline.run(ctx_fail, failure)
-
-        # Неуспешный статус (4xx)
-        ctx_4xx = DeliveryContext(
-            message_id="metrics-003",
-            destination="test",
-            url="http://example.com/4xx",
-            timeout=10,
-            schedule_id="sched-metrics-003",
-        )
-
-        async def client_error() -> None:
-            ctx_4xx.status_code = 404
-
-        await pipeline.run(ctx_4xx, client_error)
-
-        stats = metrics.stats
-        assert stats["total_attempts"] == 3
-        assert stats["success_count"] == 1  # только 200
-        assert stats["failure_count"] == 2  # исключение + 404
-        assert stats["avg_duration_ms"] >= 0
-
-    async def test_metrics_reset_on_new_instance(self) -> None:
-        """Новый экземпляр MetricsMiddleware начинается с нуля."""
-        m1 = MetricsMiddleware()
-        m2 = MetricsMiddleware()
-
-        assert m1.stats["total_attempts"] == 0
-        assert m2.stats["total_attempts"] == 0
-
-        # m1 получает данные
-        pipeline = MiddlewarePipeline([m1])
-
-        async def ok() -> None:
-            pass
-
-        ctx = DeliveryContext(
-            message_id="reset-001",
-            destination="test",
-            url="http://example.com",
-            timeout=10,
-            schedule_id="sched-reset-001",
-        )
-        ctx.status_code = 200
-        await pipeline.run(ctx, ok)
-
-        assert m1.stats["total_attempts"] == 1
-        assert m2.stats["total_attempts"] == 0  # изолированы

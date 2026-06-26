@@ -4,18 +4,16 @@ name = "pyesb-webhooker"
 dynamic = ["version"]
 description = "Container-native webhook delivery service — принимает уведомления из 1С (AMQP) или HTTP POST и доставляет на внешние URL с retry, circuit breaker и JSONL-логом"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.14"
 dependencies = [
-    "fastapi[standard-no-fastapi-cloud-cli]>=0.115.0",
+    "fastapi[standard-no-fastapi-cloud-cli]",
     "pyesb-amqp",
-    "aiosqlite>=0.20.0",
-    "sqlalchemy[asyncio]>=2.0",
-    "pyyaml>=6.0.1",
-    "apscheduler>=4.0.0a6",
-    "httpx>=0.28.1",
-    "aiorun>=2025.1.1",
-    "python-ulid>=3.1.0",
-    "cashews>=7.5.0",
+    "sniffio",
+    "pyyaml",
+    "apscheduler[sqlalchemy]",
+    "aiorun",
+    "python-ulid",
+    "cashews", "aiosqlite"
 ]
 
 [tool.uv]
@@ -121,6 +119,7 @@ ignore = [
     "D415",    # docstring punctuation
 ]
 "app/delivery/engine.py" = [
+    "C901",     # deliver_payload is complex by design
     "S101",     # assert current_task — intentional invariant check
     "PLC0415",  # lazy import json — performance (only on demand)
     "PLR0913", "PLR0915",  # APScheduler callback signature

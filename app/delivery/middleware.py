@@ -14,18 +14,13 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from app.config import settings
+from .headers import validate_header_dict
 
 __all__ = [
     "DeliveryContext",
-    "MetricsMiddleware",
     "Middleware",
     "MiddlewarePipeline",
-    "duration_buckets",
 ]
-
-# Duration buckets for histogram (in milliseconds) — from app.config.settings
-duration_buckets: list[int] = list(settings.DURATION_BUCKETS_MS)
 
 
 class DeliveryContext:
@@ -47,7 +42,12 @@ class DeliveryContext:
         self.destination = destination
         self.url = url
         self.body = body
+
+        # ── Валидация заголовков (CRLF injection prevention) ─────────
+        if headers is not None:
+            headers = validate_header_dict(headers)
         self.headers = headers or {}
+
         self.timeout = timeout
         self.schedule_id = schedule_id
         self.trace_id = trace_id
@@ -98,45 +98,3 @@ class MiddlewarePipeline:
             ctx.duration_ms = int((time.monotonic() - ctx.start_time) * 1000)
             for m in reversed(self._middlewares):
                 await m.after(ctx)
-
-
-class MetricsMiddleware(Middleware):
-    """Collect in-memory delivery metrics."""
-
-    def __init__(self) -> None:
-        self.total_attempts: int = 0
-        self.success_count: int = 0
-        self.failure_count: int = 0
-        self.total_duration_ms: int = 0
-        self._duration_buckets: list[int] = duration_buckets
-        self._duration_histogram: dict[int, int] = dict.fromkeys(duration_buckets, 0)
-
-    @property
-    def stats(self) -> dict[str, Any]:
-        return {
-            "total_attempts": self.total_attempts,
-            "success_count": self.success_count,
-            "failure_count": self.failure_count,
-            "avg_duration_ms": (
-                self.total_duration_ms // self.total_attempts if self.total_attempts else 0
-            ),
-            "duration_histogram": self._duration_histogram.copy(),
-        }
-
-    async def before(self, ctx: DeliveryContext) -> None:
-        self.total_attempts += 1
-
-    async def after(self, ctx: DeliveryContext) -> None:
-        if ctx.error is not None:
-            self.failure_count += 1
-        elif ctx.status_code is not None and 200 <= ctx.status_code < 300:
-            self.success_count += 1
-        else:
-            self.failure_count += 1
-
-        if ctx.duration_ms is not None:
-            self.total_duration_ms += ctx.duration_ms
-            for b in self._duration_buckets:
-                if ctx.duration_ms <= b:
-                    self._duration_histogram[b] += 1
-                    break

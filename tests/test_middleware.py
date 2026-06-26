@@ -9,7 +9,6 @@ import pytest
 
 from app.delivery.middleware import (
     DeliveryContext,
-    MetricsMiddleware,
     Middleware,
     MiddlewarePipeline,
 )
@@ -217,47 +216,3 @@ class TestMiddlewarePipeline:
         )
         await pipeline.run(ctx, action)
         assert order == ["M1.before", "action"]
-
-
-class TestMetricsMiddleware:
-    """MetricsMiddleware tracks attempt/success/failure counts."""
-
-    async def test_counts(self) -> None:
-        metrics = MetricsMiddleware()
-        pipeline = MiddlewarePipeline([metrics])
-
-        # Success
-        ctx1 = DeliveryContext(
-            message_id="m1",
-            destination="test",
-            url="http://example.com",
-            timeout=10,
-            schedule_id="s1",
-        )
-
-        async def success() -> None:
-            ctx1.status_code = 200
-
-        await pipeline.run(ctx1, success)
-
-        # Failure (exception)
-        ctx2 = DeliveryContext(
-            message_id="m2",
-            destination="test",
-            url="http://example.com",
-            timeout=10,
-            schedule_id="s2",
-        )
-
-        async def failure() -> None:
-            msg = "http error"
-            raise ConnectionError(msg)
-
-        with pytest.raises(ConnectionError):
-            await pipeline.run(ctx2, failure)
-
-        stats = metrics.stats
-        assert stats["total_attempts"] == 2
-        assert stats["success_count"] == 1
-        assert stats["failure_count"] == 1
-        assert stats["avg_duration_ms"] >= 0

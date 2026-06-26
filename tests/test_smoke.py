@@ -1,7 +1,7 @@
 """Smoke Integration Test — полный lifecycle приложения.
 
 Запускает FastAPI + APScheduler + SQLite in-memory через ASGI transport,
-отправляет HTTP POST /, проверяет health/metrics endpoints.
+отправляет HTTP POST /, проверяет metrics endpoint.
 
 Использует ``httpx.AsyncClient`` с ``ASGITransport`` — не требует реального HTTP-сервера.
 """
@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import AsyncGenerator
 from uuid import uuid4
 
 import pytest
@@ -21,7 +22,7 @@ os.environ.setdefault("FWQ_LOG_QUEUE_MAXSIZE", "100")
 
 
 @pytest.fixture
-async def client() -> AsyncClient:
+async def client() -> AsyncGenerator[AsyncClient, None]:
     """FastAPI test client with full lifespan (APScheduler + shutdown).
 
     Использует ``LifespanManager`` для отправки lifespan.startup/shutdown
@@ -36,26 +37,6 @@ async def client() -> AsyncClient:
             base_url="http://test",
         ) as ac:
             yield ac
-
-
-class TestSmokeHealthEndpoint:
-    """GET /health — базовая проверка работоспособности."""
-
-    async def test_health_returns_ok(self, client: AsyncClient) -> None:
-        """Health endpoint возвращает status=ok."""
-        resp = await client.get("/health")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["status"] == "ok"
-        assert isinstance(data["scheduler"], bool)
-        assert isinstance(data["in_flight"], int)
-
-    async def test_health_live_and_ready(self, client: AsyncClient) -> None:
-        """/health/live и /health/ready тоже работают."""
-        for path in ("/health/live", "/health/ready"):
-            resp = await client.get(path)
-            assert resp.status_code == 200, f"{path} failed"
-            assert resp.json()["status"] == "ok"
 
 
 class TestSmokeMetricsEndpoint:

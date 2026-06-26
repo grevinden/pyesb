@@ -61,13 +61,19 @@ class Settings:
     LOG_RESPONSE_BODY_MAX_CHARS: int = int(os.getenv("FWQ_LOG_RESPONSE_BODY_MAX_CHARS", "4096"))
     """Максимальная длина тела ответа в логах (символов)."""
 
+    # ── Validation limits (OpenAPI) ───────────────────────────────────
+    MAX_TIMEOUT: int = int(os.getenv("FWQ_MAX_TIMEOUT", "30"))
+    """Максимальный таймаут запроса (сек)."""
+
+    MAX_PAUSE: int = int(os.getenv("FWQ_MAX_PAUSE", "3600"))
+    """Максимальная пауза между retry (сек)."""
+
+    MAX_TTL: int = int(os.getenv("FWQ_MAX_TTL", "86400"))
+    """Максимальный TTL сообщения (сек)."""
+
     # ── Pretty print ───────────────────────────────────────────────────
     PRETTY_LOG: bool = os.getenv("FWQ_PRETTY_LOG", "").lower() in ("1", "true", "yes")
     """Форматированный вывод логов (indent=2) для разработки."""
-
-    # ── Metrics ──────────────────────────────────────────────────────────
-    DURATION_BUCKETS_MS: tuple[int, ...] = (10, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 30000)
-    """Границы гистограммы длительности доставки (мс)."""
 
 
 # Module-level singleton (import once → frozen dataclass)

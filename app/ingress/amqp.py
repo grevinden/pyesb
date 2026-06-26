@@ -81,19 +81,6 @@ async def amqp_handler(destination: str, msg: AmqpMessage) -> bool:
             ).emit()
             return False
 
-        schedule_id = await create_delivery_schedule(
-            _scheduler,
-            destination=destination,
-            url=str(ps.url),
-            body=ps.body,
-            headers=list(ps.headers) if ps.headers else None,
-            timeout=ps.timeout,
-            pause=ps.pause,
-            ttl=ps.ttl,
-            trace_id=trace_id,
-            message_id=message_id,
-        )
-
         PayloadReceivedAMQPEvent(
             message_id=message_id,
             correlation_id=correlation_id,
@@ -108,8 +95,23 @@ async def amqp_handler(destination: str, msg: AmqpMessage) -> bool:
             pause=ps.pause,
             ttl=ps.ttl,
             trace_id=trace_id,
-            schedule_id=schedule_id,
+            schedule_id=None,
         ).emit()
+
+        schedule_id = await create_delivery_schedule(
+            _scheduler,
+            destination=destination,
+            url=str(ps.url),
+            body=ps.body,
+            headers=list(ps.headers) if ps.headers else None,
+            timeout=ps.timeout,
+            pause=ps.pause,
+            ttl=ps.ttl,
+            trace_id=trace_id,
+            message_id=message_id,
+        )
+
+        # create_delivery_schedule эмитит DeliveryScheduledEvent
         return True
     except Exception as e:
         _raw = msg.body

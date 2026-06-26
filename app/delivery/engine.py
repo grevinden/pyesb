@@ -29,6 +29,7 @@ from app.orchestration.dlq import (
 
 from .client import _get_http_client, _http_post_with_cb
 from .context import message_id_var, trace_id_var
+from .headers import validate_header_pairs
 from .semaphore import _delivery_semaphore, _in_flight, is_shutting_down
 
 __all__ = [
@@ -75,12 +76,30 @@ async def deliver_payload(
     headers_dict = dict(headers) if headers else {}
     body_repr = await asyncio.to_thread(_truncate_json, body, _MAX_BODY_CHARS)
 
+    # ── Валидация заголовков (CRLF injection prevention) ──────────────
+    try:
+        validate_header_pairs(headers)
+    except ValueError as exc:
+        # Детально раскрываем: какой заголовок, что прислали, где CR/LF
+        _bad_headers = _format_headers_for_log(headers)
+        LogEvent().emit(
+            event="header_validation_failed",
+            message_id=message_id,
+            trace_id=trace_id,
+            destination=destination,
+            url=url,
+            headers=_bad_headers,
+            error=str(exc),
+        )
+        return
+
     current_task = asyncio.current_task()
     assert current_task is not None, "deliver_payload must run inside an asyncio task"
     _in_flight.add(current_task)
 
     _attempt_counts[schedule_id] = _attempt_counts.get(schedule_id, 0) + 1
 
+    semaphore_acquired = False
     try:
         body_size = await asyncio.to_thread(_json_size, body)
         DeliveryAttemptEvent(
@@ -93,7 +112,6 @@ async def deliver_payload(
             timeout=timeout,
         ).emit()
 
-        semaphore_acquired: bool = False
         if not is_shutting_down():
             await _delivery_semaphore.acquire()
             semaphore_acquired = True
@@ -240,3 +258,20 @@ def _json_size(obj: object) -> int | None:
         return len(json_mod.dumps(obj, default=str).encode("utf-8"))
     except Exception:
         return None
+
+
+def _format_headers_for_log(headers: list[tuple[str, str]] | None) -> list[dict[str, str]] | None:
+    """Подготовить заголовки для читаемого вывода в лог.
+
+    Каждый заголовок — ``{"key": ..., "value": ...}``,
+    значения обрезаны до 200 символов.
+    """
+    if headers is None:
+        return None
+    result: list[dict[str, str]] = []
+    for key, value in headers:
+        result.append({
+            "key": _truncate_text(key, 200) or "",
+            "value": _truncate_text(value, 200) or "",
+        })
+    return result

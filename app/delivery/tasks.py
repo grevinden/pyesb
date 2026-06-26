@@ -10,6 +10,8 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Coroutine
+from typing import Any
 
 from app.events import UnhandledTaskErrorEvent
 
@@ -19,7 +21,7 @@ __all__ = [
 
 
 def safe_create_task(
-    coro: asyncio.Future[object] | asyncio.Task[object],
+    coro: Coroutine[Any, Any, Any],
     *,
     name: str | None = None,
 ) -> asyncio.Task[None]:
