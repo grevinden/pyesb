@@ -18,6 +18,7 @@ from pyesb_amqp import AmqpMessage, AmqpServer, E1CMessage
 from pyesb_amqp.oidc import ChannelDesription
 from pyesb_amqp.oidc import add_routes as oidc_add_routes
 
+from .config import settings
 from .database import close_db, get_engine
 from .events import (
     HandlerFailedEvent,
@@ -36,9 +37,7 @@ from .log import (
     stderr_redirect_lifespan,
     stop_logging_queue,
 )
-
-# Константы для поиска trace_id в заголовках сообщения
-_TRACE_ID_HEADER = "X-Trace-Id"
+from .router import first_str, resolve_trace_id
 
 # ---------------------------------------------------------------------------
 # Архитектура приёма сообщений
@@ -97,6 +96,9 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     ServiceStartupEvent().emit()
 
     from .delivery import create_delivery_schedule
+    from .middleware import MetricsMiddleware
+
+    metrics = MetricsMiddleware()
 
     @asynccontextmanager
     async def _shutdown_guard() -> AsyncGenerator[None, None]:
@@ -107,19 +109,19 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
         finally:
             _shutting_down = True
             ShutdownAmqpStoppedEvent().emit()
-            await wait_for_in_flight(timeout=30)
+            await wait_for_in_flight(timeout=float(settings.SHUTDOWN_TIMEOUT))
             ShutdownDeliveriesResolvedEvent().emit()
 
     async with AsyncExitStack() as exit_stack:
         # ── 1. Scheduler (exits LAST) ─────────────────────────────────
         scheduler = AsyncScheduler(
             data_store=SQLAlchemyDataStore(get_engine()),
-            max_concurrent_jobs=20,
+            max_concurrent_jobs=settings.SCHEDULER_MAX_CONCURRENT,
             task_defaults=TaskDefaults(max_running_jobs=None),
         )
         await exit_stack.enter_async_context(scheduler)
         await scheduler.start_in_background()
-        SchedulerStartedEvent(max_concurrent=20).emit()
+        SchedulerStartedEvent(max_concurrent=settings.SCHEDULER_MAX_CONCURRENT).emit()
 
         # ── 2. Shutdown guard (exits BETWEEN AMQP and Scheduler) ──────
         await exit_stack.enter_async_context(_shutdown_guard())
@@ -139,12 +141,15 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
                     else None
                 )
                 _props = parsed.application_properties
-                sender_code = _first_str(_props.integ_sender_code)
-                recipient_code = _first_str(_props.integ_recipient_code)
+                sender_code = first_str(_props.integ_sender_code)
+                recipient_code = first_str(_props.integ_recipient_code)
                 integ_message_id = str(_props.integ_message_id)
 
+                # ── delivery_count: сколько раз AMQP-брокер уже выдавал сообщение ──
+                delivery_count = parsed.header.delivery_count
+
                 # ── trace_id: из тела сообщения, либо из заголовка X-Trace-Id ──
-                trace_id = _resolve_trace_id(ps.trace_id, ps.headers)
+                trace_id = resolve_trace_id(ps.trace_id, ps.headers)
 
                 schedule_id = await create_delivery_schedule(
                     scheduler,
@@ -165,6 +170,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
                     sender_code=sender_code,
                     recipient_code=recipient_code,
                     integ_message_id=integ_message_id,
+                    delivery_count=delivery_count,
                     destination=destination,
                     url=str(ps.url),
                     headers=fmt_headers(ps.headers),
@@ -186,58 +192,18 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
         await exit_stack.enter_async_context(stderr_redirect_lifespan())
         await exit_stack.enter_async_context(AmqpServer(handler=amqp_handler))
 
-        # ── 5. Фиксируем scheduler в app.state ────────────────────────
+        # ── 5. Фиксируем scheduler и metrics в app.state ───────────────
         # Используем module-level app (oidc_add_routes wrapper),
         # т.к. request.app при обращении из эндпоинта — это враппер,
         # а не оригинальный FastAPI (_app).
         app.state.scheduler = scheduler  # noqa: F821 — module-level app
+        app.state.metrics = metrics  # noqa: F821 — для GET /metrics
         yield
 
     # ── После выхода из стека: scheduler остановлен ────────────────────
     await close_db()
     ShutdownCompleteEvent().emit()
     stop_logging_queue()  # flush всех оставшихся записей
-
-
-def _first_str(val: str | list[str] | None) -> str | None:
-    """Извлечь первую строку из значения, которое может быть str, list[str] или None.
-
-    AMQP application properties из pyesb_amqp иногда приходят как ``list[str]``
-    (напр. ``integ_sender_code``, ``integ_recipient_code``).
-    """
-    if val is None:
-        return None
-    if isinstance(val, list):
-        return val[0] if val else None
-    return val
-
-
-def _resolve_trace_id(
-    trace_id: UUID | None,
-    headers: set[tuple[str, str]] | None,
-) -> str | None:
-    """Получить trace_id из тела сообщения (приоритет) или из заголовка X-Trace-Id.
-
-    Если ``trace_id`` передан в теле (``PayloadSchema.trace_id``) — используем его.
-    Иначе ищем заголовок ``X-Trace-Id`` в ``headers`` (case-insensitive).
-    Возвращаем только валидный UUID.
-    """
-    # 1. Из тела сообщения (PayloadSchema.trace_id)
-    if trace_id is not None:
-        return str(trace_id)
-
-    # 2. Из заголовка X-Trace-Id
-    if headers:
-        for key, value in headers:
-            if key.lower() == _TRACE_ID_HEADER.lower():
-                try:
-                    UUID(value)
-                    return value
-                except ValueError:
-                    pass
-                return None  # нашли X-Trace-Id, но не UUID — не используем
-
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +240,7 @@ app = oidc_add_routes(
         openapi_url="/openapi.json",
         swagger_ui_oauth2_redirect_url=None,
         lifespan=lifespan,
+        debug=__debug__,
     ),
 )
 
@@ -311,7 +278,7 @@ async def post(
     message_id = str(uuid4())
 
     # ── trace_id: из тела запроса, либо из заголовка X-Trace-Id ──
-    trace_id = _resolve_trace_id(payload.trace_id, payload.headers)
+    trace_id = resolve_trace_id(payload.trace_id, payload.headers)
 
     schedule_id = await create_delivery_schedule(
         scheduler,
@@ -337,3 +304,47 @@ async def post(
         trace_id=trace_id,
         schedule_id=schedule_id,
     ).emit()
+
+
+# ---------------------------------------------------------------------------
+# GET /metrics — метрики доставки (in-memory)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/metrics", status_code=200)
+@app.get("/metrics/json", status_code=200)
+async def get_metrics(request: Request) -> dict[str, object]:
+    """Текущие метрики доставки сообщений.
+
+    Счётчики сбрасываются при перезапуске процесса (in-memory).
+    Поля: total_attempts, success_count, failure_count, avg_duration_ms.
+    """
+    metrics = getattr(request.app.state, "metrics", None)
+    if metrics is None:
+        return {"status": "unavailable", "reason": "metrics not initialized"}
+    return {"status": "ok", **metrics.stats}
+
+
+# ---------------------------------------------------------------------------
+# GET /health — health check (K8s liveness / readiness probe)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/health", status_code=200)
+@app.get("/health/live", status_code=200)
+@app.get("/health/ready", status_code=200)
+async def health(request: Request) -> dict[str, object]:
+    """Health check — статус компонентов системы.
+
+    Возвращает состояние scheduler'а, количество in-flight доставок,
+    и uptime сервера.
+    """
+    scheduler = getattr(request.app.state, "scheduler", None)
+    from app.delivery import _in_flight, _shutting_down
+
+    return {
+        "status": "ok",
+        "scheduler": scheduler is not None,
+        "in_flight": len(_in_flight),
+        "shutting_down": _shutting_down,
+    }

@@ -2,58 +2,35 @@
 
 Usage::
 
-    from app.log import get_logger
+    from app.events import SomeEvent
+    SomeEvent(...).emit()
 
-    logger = get_logger(__name__)
-    logger.info("msg", key="value")
+Для stderr redirect (Rust tracing pyesb-amqp) используется
+``_jsonl_line()`` — обёртка с ``dt`` и ``ulid``.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json as json_module
-import logging.config
+import logging
 import logging.handlers
 import os
 import re
 from collections.abc import AsyncGenerator, MutableMapping
 from contextlib import asynccontextmanager
 from logging.handlers import QueueHandler, QueueListener
-from pathlib import Path
 from queue import Queue
 
 import structlog
-import yaml
 
-
-class JsonlFormatter(logging.Formatter):
-    """Convert any log record to JSONL.
-
-    * structlog records  -> msg is already JSON -> output as-is
-    * uvicorn / stdlib   -> wrap plain text in JSON
-    """
-
-    def format(self, record: logging.LogRecord) -> str:
-        raw = record.getMessage()
-        try:
-            json_module.loads(raw)
-            return raw
-        except (json_module.JSONDecodeError, ValueError):
-            pass
-        return json_module.dumps(
-            {
-                "event": raw,
-                "level": record.levelname.lower(),
-                "logger": record.name,
-                "module": record.module,
-                "line": record.lineno,
-                "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
-            },
-            default=str,
-        )
-
+from .config import settings
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+# Pattern for Python traceback lines (starts with spaces + "File").
+# These are NOT valid JSON and come from unhandled exceptions in
+# Rust→Python bridge (pyesb-amqp callback threads).
+_TRACEBACK_FILE_RE = re.compile(r"^\s+File \"")
 
 
 def _clean(line: str) -> str:
@@ -61,10 +38,45 @@ def _clean(line: str) -> str:
     return _ANSI_RE.sub("", line).rstrip("\n\r")
 
 
-def _jsonl_line(raw: str, level: str = "info") -> str:
-    """Wrap a plain-text line in JSONL, stripping ANSI codes."""
-    return json_module.dumps(
-        {"event": _clean(raw), "level": level, "logger": "pyesb_amqp"},
+def _detect_stderr_level(raw: str) -> str:
+    """Heuristic: determine log level for a plain-text stderr line.
+
+    Traceback lines (``File "..."``), ``Traceback`` headers, and explicit
+    ``Error:`` / ``Exception:`` markers are promoted to ``error``.
+    """
+    stripped = raw.lstrip()
+    if _TRACEBACK_FILE_RE.match(raw) or stripped.startswith("Traceback"):
+        return "error"
+    if stripped.startswith(("Error:", "Exception:", "ValueError:", "TypeError:")):
+        return "error"
+    return "info"
+
+
+def _jsonl_line(raw: str, level: str | None = None) -> str:
+    """Wrap a plain-text line in JSONL, stripping ANSI codes.
+
+    Добавляет ``dt`` и ``ulid`` для совместимости с форматом
+    ``LogEvent``-моделей. ``timestamp`` (от structlog) дублирует
+    ``dt`` — это нормально для stderr-потока (нет Pydantic-модели).
+    """
+    if level is None:
+        level = _detect_stderr_level(raw)
+    import json as _json_mod
+    from datetime import datetime, timezone
+
+    from ulid import ULID
+
+    now = datetime.now(timezone.utc)
+    ts = now.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    return _json_mod.dumps(
+        {
+            "dt": ts,
+            "ulid": str(ULID()),
+            "event": _clean(raw),
+            "level": level,
+            "logger": "pyesb_amqp",
+            "timestamp": ts,
+        },
         default=str,
     )
 
@@ -130,22 +142,24 @@ async def stderr_to_jsonl(r_fd: int) -> None:
             line = await loop.run_in_executor(None, os.read, r_fd, 4096)
             if not line:
                 break
+            import json as _json_mod
+
             for raw in line.decode("utf-8", errors="replace").splitlines():
                 if not raw.strip():
                     continue
                 # Already valid JSON -> pass through
                 try:
-                    json_module.loads(_clean(raw))
+                    _json_mod.loads(_clean(raw))
                     output = raw
-                except (json_module.JSONDecodeError, ValueError):
+                except (_json_mod.JSONDecodeError, ValueError):
                     output = _jsonl_line(raw)
                 await _async_print(output)
         except OSError:
             break
         except Exception:
-            structlog.get_logger("stderr_redirect").exception(
-                "stderr_to_jsonl_error, restarting"
-            )
+            from app.events import StderrReaderErrorEvent
+
+            StderrReaderErrorEvent().emit()
             await asyncio.sleep(1)
 
 
@@ -183,7 +197,30 @@ def _add_context_vars(
 # ---------------------------------------------------------------------------
 
 
-def start_logging_queue(maxsize: int = 5000) -> None:
+class _StructlogAwareQueueHandler(QueueHandler):
+    """QueueHandler that preserves structlog's ``event_dict`` in ``record.msg``.
+
+    The default :meth:`QueueHandler.prepare` calls :meth:`Handler.format`
+    which serializes ``record.msg`` to a string (via ``str(record.msg)``).
+    For structlog records this **destroys** the ``event_dict`` dict that
+    :class:`structlog.stdlib.ProcessorFormatter` expects at format time.
+
+    Since we use an **in-process** ``queue.Queue`` (not multiprocessing),
+    we don't need pickleability. Override ``prepare()`` to preserve dict
+    ``msg`` untouched.
+    """
+
+    def prepare(self, record: logging.LogRecord) -> logging.LogRecord:
+        if isinstance(record.msg, dict):
+            # Structlog record — keep the event_dict as-is.
+            # The default prepare() would call Handler.format() which
+            # does str(record.msg) — destroying the dict.
+            return record
+        # Stdlib string record — default prepare is safe.
+        return super().prepare(record)
+
+
+def start_logging_queue(maxsize: int | None = None) -> None:
     """Wrap root logger handlers with ``QueueHandler`` + ``QueueListener``.
 
     Заменяет синхронный ``StreamHandler`` (блокирует event loop при
@@ -201,8 +238,10 @@ def start_logging_queue(maxsize: int = 5000) -> None:
     if _log_listener is not None or not root.handlers:
         return
 
+    if maxsize is None:
+        maxsize = settings.LOG_QUEUE_MAXSIZE
     q: Queue[logging.LogRecord] = Queue(maxsize=maxsize)
-    qh = QueueHandler(q)
+    qh = _StructlogAwareQueueHandler(q)
 
     # Переносим существующие хендлеры в QueueListener
     original_handlers = root.handlers[:]
@@ -229,19 +268,25 @@ def stop_logging_queue() -> None:
 # ---------------------------------------------------------------------------
 
 
-def load_logging_config(config_path: str = "logging.yaml") -> None:
-    """Load ``logging.yaml`` and bridge structlog -> stdlib.
+def load_logging_config() -> None:
+    """Configure structlog + stdlib logging bridge.
+
+    Все записи (structlog и stdlib) проходят через
+    ``structlog.stdlib.ProcessorFormatter``, что гарантирует
+    единый формат JSONL для всех источников.
+
+    **Structlog-записи** (``events.py``):
+        ``processors`` → ``wrap_for_formatter`` → ``ProcessorFormatter`` → JSON
+
+    **Stdlib-записи** (apscheduler, uvicorn):
+        ``foreign_pre_chain`` → ``ProcessorFormatter`` → JSON
 
     Call **before** the main event loop starts (inside ``lifespan``).
     """
-    path = Path(config_path)
-    if not path.is_absolute():
-        path = Path.cwd() / path
-    with path.open() as f:
-        cfg = yaml.safe_load(f)
-    logging.config.dictConfig(cfg)
-
-    # structlog -> stdlib bridging
+    # Idempotency guard — не настраиваем дважды (важно для тестов)
+    if logging.getLogger().hasHandlers():
+        return
+    # ── 1. Configure structlog processors ───────────────────────────
     structlog.configure(
         processors=[
             structlog.stdlib.filter_by_level,
@@ -251,13 +296,41 @@ def load_logging_config(config_path: str = "logging.yaml") -> None:
             structlog.processors.StackInfoRenderer(),
             structlog.dev.set_exc_info,
             _add_context_vars,  # inject message_id, trace_id from contextvars
-            structlog.processors.JSONRenderer(),
+            # wrap_for_formatter — финальный процессор для structlog-записей.
+            # Он преобразует event_dict в строку и кладёт её в LogRecord.msg.
+            # Затем ProcessorFormatter забирает её и рендерит через processor.
+            structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
         ],
         context_class=dict,
         logger_factory=structlog.stdlib.LoggerFactory(),
         wrapper_class=structlog.stdlib.BoundLogger,
         cache_logger_on_first_use=True,
     )
+
+    # ── 2. Setup stdlib handler with ProcessorFormatter ─────────────
+    # ProcessorFormatter — единый форматтер для всех stdlib handler-ов.
+    #   * processor: финальный рендеринг (JSON) — применяется ко ВСЕМ записям
+    #   * foreign_pre_chain: цепочка для stdlib-записей (НЕ structlog)
+    formatter = structlog.stdlib.ProcessorFormatter(
+        processor=structlog.processors.JSONRenderer(),
+        foreign_pre_chain=[
+            structlog.stdlib.add_log_level,
+            structlog.stdlib.add_logger_name,
+            structlog.processors.TimeStamper(fmt="iso"),
+        ],
+    )
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(formatter)
+
+    root = logging.getLogger()
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+
+    # ── 3. Set levels for third-party loggers ───────────────────────
+    logging.getLogger("uvicorn").setLevel(logging.INFO)
+    logging.getLogger("apscheduler").setLevel(logging.INFO)
+    logging.getLogger("fastapi").setLevel(logging.INFO)
 
 
 @asynccontextmanager
@@ -271,8 +344,13 @@ async def stderr_redirect_lifespan() -> AsyncGenerator[None, None]:
             async with stderr_redirect_lifespan():
                 yield
     """
+    from app.tasks import safe_create_task
+
     r_fd, original_fd = redirect_stderr()
-    task = asyncio.create_task(stderr_to_jsonl(r_fd))
+    task = safe_create_task(
+        stderr_to_jsonl(r_fd),
+        name="stderr-to-jsonl",
+    )
     try:
         yield
     finally:

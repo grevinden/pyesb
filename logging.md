@@ -12,7 +12,7 @@ Application code
     v
 structlog (.info, .warning, .error, .exception)
     |  processors: filter_by_level -> add_log_level -> TimeStamper -> StackInfoRenderer
-    |              -> set_exc_info -> _add_context_vars -> JSONRenderer
+    |              -> set_exc_info -> _add_context_vars -> wrap_for_formatter
     v
 stdlib logging (logging.getLogger().info)
     |
@@ -22,7 +22,11 @@ QueueHandler (queue.Queue, maxsize=5000)   <- не блокирует event loop
     v [фоновый поток QueueListener]
     |
     v
-StreamHandler + JsonlFormatter
+ProcessorFormatter                         <- единый форматтер для ВСЕХ записей
+    |  processor=JSONRenderer
+    |  foreign_pre_chain=[add_log_level, add_logger_name, TimeStamper]
+    v
+StreamHandler
     |
     v
 stdout (fd 1)
@@ -45,27 +49,167 @@ pyesb-amqp Rust tracing -> stderr (fd 2, pipe) -> asyncio task: os.read()
 и переиспользуются через множественное наследование — ни одно поле
 не определено более чем в одном месте:
 
-```
-LogEvent (база: extra=forbid, validate_default=True)
-│
-├── ScheduleRef      (schedule_id)              ← единственное определение
-├── TargetRef        (destination, url)          ← единственное определение
-├── MessageRef       (message_id, trace_id)       ← единственное определение
-│
-├── DeliveryEventBase = ScheduleRef + TargetRef        ← без своих полей
-│   ├── DeliveryAttemptEvent       + headers, body_size, body, timeout
-│   ├── DeliveryResponseEvent      + status_code, response_headers, …
-│   ├── DeliverySuccessEvent       + status_code, duration_ms
-│   ├── DeliveryHttpErrorEvent     + status_code, error
-│   ├── DeliveryFailedEvent        + error, duration_ms
-│   └── DeliveryScheduledEvent     + MessageRef + pause, ttl, end_time
-│
-├── DeliverySkippedShutdownEvent = MessageRef + TargetRef  ← без своих полей
-├── ScheduleRemoveSkippedEvent    = ScheduleRef             ← без своих полей
-├── PayloadReceivedEvent          = MessageRef + TargetRef + ScheduleRef
-│   └── PayloadReceivedAMQPEvent  + correlation_id, sender_code, …
-│
-└── Остальные (HandlerFailedEvent, …) — standalone, нет пересечений
+```mermaid
+classDiagram
+    direction TB
+    class LogEvent {
+        +PastDatetime dt
+        +ULID ulid
+        +emit()
+        +_event_name: ClassVar[str]
+        +_level: ClassVar[str]
+    }
+    class ScheduleRef {
+        +str schedule_id
+    }
+    class TargetRef {
+        +str destination
+        +str url
+    }
+    class MessageRef {
+        +str message_id
+        +str trace_id
+    }
+    class DeliveryEventBase {
+        <<mixin>>
+    }
+    class DeliveryAttemptEvent {
+        +headers
+        +body_size
+        +body
+        +timeout
+    }
+    class DeliveryResponseEvent {
+        +status_code
+        +response_headers
+        +response_body
+        +duration_ms
+    }
+    class DeliverySuccessEvent {
+        +status_code
+        +duration_ms
+    }
+    class DeliveryHttpErrorEvent {
+        +status_code
+        +error
+    }
+    class DeliveryFailedEvent {
+        +error
+        +duration_ms
+    }
+    class DeliveryScheduledEvent {
+        +pause
+        +ttl
+        +end_time
+    }
+    class DeliverySkippedShutdownEvent {
+        <<mixin>>
+    }
+    class ScheduleRemoveSkippedEvent {
+        <<mixin>>
+    }
+    class PayloadReceivedEvent {
+        +headers
+        +timeout
+        +pause
+        +ttl
+    }
+    class PayloadReceivedAMQPEvent {
+        +correlation_id
+        +sender_code
+        +recipient_code
+        +integ_message_id
+        +delivery_count
+    }
+    class DeliveryExpiredEvent {
+        +pause
+        +ttl
+        +error
+        +attempts
+    }
+    class HandlerFailedEvent {
+        +destination
+        +error
+    }
+    class SchedulerStartedEvent {
+        +max_concurrent
+    }
+    class ServiceStartupEvent {
+        <<standalone>>
+    }
+    class ShutdownCompleteEvent {
+        <<standalone>>
+    }
+    class ShutdownAmqpStoppedEvent {
+        <<standalone>>
+    }
+    class ShutdownDeliveriesResolvedEvent {
+        <<standalone>>
+    }
+    class ShutdownDeliveriesCompletedEvent {
+        <<standalone>>
+    }
+    class ShutdownWaitingEvent {
+        +count
+        +timeout
+    }
+    class ShutdownTimeoutEvent {
+        +remaining
+        +timeout
+    }
+    class ShutdownCancelledEvent {
+        +count
+    }
+    class FatalErrorEvent {
+        +error
+    }
+    class StderrReaderErrorEvent {
+        <<standalone>>
+    }
+    class UnhandledTaskErrorEvent {
+        +task_name
+    }
+
+    LogEvent <|-- ScheduleRef
+    LogEvent <|-- TargetRef
+    LogEvent <|-- MessageRef
+    LogEvent <|-- DeliveryEventBase
+    LogEvent <|-- DeliverySkippedShutdownEvent
+    LogEvent <|-- ScheduleRemoveSkippedEvent
+    LogEvent <|-- PayloadReceivedEvent
+    LogEvent <|-- HandlerFailedEvent
+    LogEvent <|-- SchedulerStartedEvent
+    LogEvent <|-- ServiceStartupEvent
+    LogEvent <|-- ShutdownCompleteEvent
+    LogEvent <|-- ShutdownAmqpStoppedEvent
+    LogEvent <|-- ShutdownDeliveriesResolvedEvent
+    LogEvent <|-- ShutdownDeliveriesCompletedEvent
+    LogEvent <|-- ShutdownWaitingEvent
+    LogEvent <|-- ShutdownTimeoutEvent
+    LogEvent <|-- ShutdownCancelledEvent
+    LogEvent <|-- FatalErrorEvent
+    LogEvent <|-- StderrReaderErrorEvent
+    LogEvent <|-- UnhandledTaskErrorEvent
+    LogEvent <|-- DeliveryExpiredEvent
+    ScheduleRef <|-- DeliveryEventBase
+    TargetRef <|-- DeliveryEventBase
+    DeliveryEventBase <|-- DeliveryAttemptEvent
+    DeliveryEventBase <|-- DeliveryResponseEvent
+    DeliveryEventBase <|-- DeliverySuccessEvent
+    DeliveryEventBase <|-- DeliveryHttpErrorEvent
+    DeliveryEventBase <|-- DeliveryFailedEvent
+    DeliveryEventBase <|-- DeliveryScheduledEvent
+    ScheduleRef <|-- ScheduleRemoveSkippedEvent
+    MessageRef <|-- DeliveryScheduledEvent
+    MessageRef <|-- DeliverySkippedShutdownEvent
+    MessageRef <|-- PayloadReceivedEvent
+    MessageRef <|-- DeliveryExpiredEvent
+    TargetRef <|-- DeliverySkippedShutdownEvent
+    TargetRef <|-- PayloadReceivedEvent
+    TargetRef <|-- DeliveryExpiredEvent
+    ScheduleRef <|-- PayloadReceivedEvent
+    ScheduleRef <|-- DeliveryExpiredEvent
+    PayloadReceivedEvent <|-- PayloadReceivedAMQPEvent
 ```
 
 **Ключевой принцип:** каждое поле определено ровно один раз.
@@ -100,7 +244,7 @@ LogEvent (база: extra=forbid, validate_default=True)
 
 | № | Событие | Уровень | Описание | Где | Поля |
 |---|---------|---------|----------|-----|------|
-| 4 | `payload_received` (AMQP) | `info` | **Новое сообщение из 1С.** AMQP-сообщение успешно распарсено в PayloadSchema. Создано расписание доставки на внешний URL. Если `trace_id` не был в теле, проверен заголовок `X-Trace-Id`. | `main.py:160` | `message_id`, `correlation_id`, `sender_code`, `recipient_code`, `integ_message_id`, `destination`, `url`, `headers`, `timeout`, `pause`, `ttl`, `trace_id`, `schedule_id` |
+| 4 | `payload_received` (AMQP) | `info` | **Новое сообщение из 1С.** AMQP-сообщение успешно распарсено в PayloadSchema. Создано расписание доставки на внешний URL. Если `trace_id` не был в теле, проверен заголовок `X-Trace-Id`. `delivery_count` — сколько раз AMQP-брокер уже выдавал это сообщение (повторная доставка > 0). | `main.py:160` | `message_id`, `correlation_id`, `sender_code`, `recipient_code`, `integ_message_id`, **`delivery_count`**, `destination`, `url`, `headers`, `timeout`, `pause`, `ttl`, `trace_id`, `schedule_id` |
 | 5 | `payload_received` (HTTP) | `info` | **Новый HTTP-запрос.** POST `/` от внешней системы. Сгенерирован `message_id` (UUIDv4), создано расписание доставки. | `main.py:314` | `message_id`, `destination`, `url`, `headers`, `timeout`, `pause`, `ttl`, `trace_id`, `schedule_id` |
 | 6 | `handler_failed` | `error` | **Ошибка парсинга.** AMQP-сообщение не удалось распарсить (невалидный JSON, не хватает полей). Сообщение отклонено, `return False`. | `main.py:177` | `destination`, `error` |
 
@@ -137,10 +281,12 @@ LogEvent (база: extra=forbid, validate_default=True)
 
 | № | Событие | Уровень | Описание | Где | Поля |
 |---|---------|---------|----------|-----|------|
-| 21 | `stderr_to_jsonl_error, restarting` | `exception` | **Ошибка stderr-reader.** Не удалось прочитать stderr от pyesb-amqp (Rust tracing). Task перезапустится через 1 секунду. Если ошибка повторяется — проблемы с pipe. | `log.py:147` | *(stack trace в exception)* |
-| 22 | `fatal_error` | `exception` | **Фатальная ошибка.** Приложение не смогло запуститься (startup failure). Процесс завершится с ненулевым кодом. | `__main__.py:62` | `error` |
+| 21 | `stderr_to_jsonl_error, restarting` | `exception` | **Ошибка stderr-reader.** Не удалось прочитать stderr от pyesb-amqp (Rust tracing). Task перезапустится через 1 секунду. Если ошибка повторяется — проблемы с pipe. | `events.py:StderrReaderErrorEvent` | *(stack trace в exception)* |
+| 22 | `fatal_error` | `exception` | **Фатальная ошибка.** Приложение не смогло запуститься (startup failure). Процесс завершится с ненулевым кодом. | `events.py:FatalErrorEvent` | `error` |
+| 23 | `unhandled_task_error` | `exception` | **Необработанная ошибка в фоновой задаче.** `safe_create_task` перехватил исключение, залогировал и пробросил. | `events.py:UnhandledTaskErrorEvent` | `task_name` |
+| 24 | `delivery_expired` | `warning` | **TTL исчерпан, доставка не удалась.** Аналог DLQ. Все retry-попытки закончились, целевой сервер так и не ответил 2xx. Требует ручного анализа. | `events.py:DeliveryExpiredEvent` | `schedule_id`, `destination`, `url`, `message_id`, `trace_id`, `attempts` |
 
-> **Примечание о `trace_id`:** Поля `message_id` и `trace_id` в событиях `delivery_attempt`, `delivery_response`, `delivery_success`, `delivery_http_error`, `delivery_failed`, `schedule_remove_skipped` не указаны в колонке "Поля", потому что они добавляются **автоматически** через `contextvars` (processor `_add_context_vars`). Другими словами, эти события **всегда содержат** `message_id` и `trace_id` (если trace_id был передан) -- без явного кода.
+> **Примечание о `trace_id`:** Поля `message_id` и `trace_id` в событиях `delivery_attempt`, `delivery_response`, `delivery_success`, `delivery_http_error`, `delivery_failed` не указаны в колонке "Поля", потому что они добавляются **автоматически** через `contextvars` (processor `_add_context_vars`). Другими словами, эти события **всегда содержат** `message_id` и `trace_id` (если trace_id был передан) -- без явного кода. Исключение: `schedule_remove_skipped` не содержит этих полей, так как не выполняется внутри контекста `deliver_payload`.
 
 ---
 
@@ -149,16 +295,18 @@ LogEvent (база: extra=forbid, validate_default=True)
 ```mermaid
 flowchart TB
     subgraph Inbound[Входящие сообщения]
-        AMQP[AMQP / pyesb-amqp\nrouting-key = destination] -->|parse Message| AMQP_OK{Валидация}
-        AMQP_OK -->|успех| PAYLOAD_RECV_AMQP["payload_received\nmessage_id, correlation_id,\nsender_code, recipient_code,\ninteg_message_id, destination,\nurl, headers, timeout, pause,\nttl, trace_id"]
+        AMQP[AMQP / pyesb-amqp] -->|parse Message| AMQP_OK{Валидация}
+        AMQP_OK -->|успех| PAYLOAD_RECV_AMQP["payload_received (AMQP)\nmessage_id, destination,\nurl, headers, timeout,\npause, ttl, trace_id,\ncorrelation_id, sender_code,\nrecipient_code, integ_message_id,\ndelivery_count"]
         AMQP_OK -->|ошибка| HANDLER_FAILED["handler_failed\ndestination, error"]
 
-        HTTP[HTTP POST /] -->|create delivery schedule| PAYLOAD_RECV_HTTP["payload_received\nmessage_id, destination,\nurl, headers, timeout, pause,\nttl, trace_id"]
+        HTTP[HTTP POST /]
+        HTTP -->|create delivery schedule| PAYLOAD_RECV_HTTP["payload_received (HTTP)\nmessage_id, destination,\nurl, headers, timeout,\npause, ttl, trace_id"]
     end
 
     subgraph Scheduling[Планирование]
-        PAYLOAD_RECV_AMQP & PAYLOAD_RECV_HTTP --> CREATE_SCHEDULE[create_delivery_schedule\nAPScheduler IntervalTrigger]
-        CREATE_SCHEDULE --> DELIVERY_SCHEDULED["delivery_scheduled\nmessage_id, schedule_id,\ndestination, url, pause, ttl,\ntrace_id, end_time"]
+        PAYLOAD_RECV_AMQP --> CREATE_SCHEDULE[create_delivery_schedule\nAPScheduler IntervalTrigger]
+        PAYLOAD_RECV_HTTP --> CREATE_SCHEDULE
+        CREATE_SCHEDULE --> DELIVERY_SCHEDULED["delivery_scheduled\nmessage_id, schedule_id,\ndestination, url, pause,\nttl, trace_id, end_time"]
         DELIVERY_SCHEDULED --> APSCHEDULER[APScheduler\nmax_concurrent_jobs=20\nSQLAlchemyDataStore]
     end
 
@@ -169,19 +317,22 @@ flowchart TB
 
         ATTEMPT --> HTTP_POST[HTTP POST via httpx.AsyncClient\nshutdown_waits_for]
 
-        HTTP_POST --> RESPONSE["delivery_response\nmessage_id, trace_id,\nstatus_code, response_headers,\nresponse_body, duration_ms\nWARNING логируется ДО raise_for_status"]
+        HTTP_POST --> RESPONSE["delivery_response\nmessage_id, trace_id,\nstatus_code, response_headers,\nresponse_body, duration_ms\n⚠️ логируется ДО raise_for_status"]
 
         RESPONSE --> STATUS_CHECK{HTTP status?}
 
         STATUS_CHECK -->|2xx| SUCCESS["delivery_success\nmessage_id, trace_id,\nstatus_code, duration_ms"]
         STATUS_CHECK -->|4xx-5xx| HTTP_ERROR["delivery_http_error\nmessage_id, trace_id,\nstatus_code, error"]
-        STATUS_CHECK -->|сеть/таймаут/другое| FAILED["delivery_failed\nmessage_id, trace_id,\nerror, duration_ms"]
+        STATUS_CHECK -->|сеть/таймаут| FAILED["delivery_failed\nmessage_id, trace_id,\nerror, duration_ms"]
 
         SUCCESS --> REMOVE_SCHED[remove_schedule]
         REMOVE_SCHED -->|not found| SKIP_REMOVE["schedule_remove_skipped\nschedule_id"]
-        REMOVE_SCHED -->|ok| END_DELIVERY(("Доставка завершена"))
+        REMOVE_SCHED -->|ok| END_DELIVERY(("Доставка\nзавершена"))
 
-        HTTP_ERROR & FAILED -->|APScheduler retry\nпо IntervalTrigger| APSCHEDULER
+        HTTP_ERROR -->|retry по IntervalTrigger| APSCHEDULER
+        FAILED -->|retry по IntervalTrigger| APSCHEDULER
+        HTTP_ERROR -->|TTL истёк| EXPIRED["delivery_expired\n⚠️ DLQ — ручной анализ\nschedule_id, destination, url,\nmessage_id, trace_id, attempts"]
+        FAILED -->|TTL истёк| EXPIRED
     end
 
     subgraph Shutdown[Graceful Shutdown sequence]
@@ -202,7 +353,8 @@ flowchart TB
 
         TIMEOUT_CHECK -->|нет| COMPLETED["shutdown: deliveries_completed"]
 
-        CANCELLED & COMPLETED --> RESOLVED["shutdown: deliveries_resolved"]
+        CANCELLED --> RESOLVED["shutdown: deliveries_resolved"]
+        COMPLETED --> RESOLVED
         RESOLVED --> SCHEDULER_STOP[AsyncScheduler stop]
         SCHEDULER_STOP --> CLOSE_DB[close_db]
         CLOSE_DB --> STOP_QUEUE[stop_logging_queue]
@@ -210,13 +362,15 @@ flowchart TB
     end
 
     subgraph ServiceLifecycle[Жизненный цикл сервиса]
-        STARTUP["service_startup"] --> SCHED_STARTED["scheduler_started\nmax_concurrent"]
+        STARTUP["service_startup"]
+        STARTUP --> SCHED_STARTED["scheduler_started\nmax_concurrent"]
         SCHED_STARTED -->|app ready| Inbound
     end
 
     subgraph Errors[Аварийные ситуации]
         STDERR_CRASH["stderr_to_jsonl_error, restarting\n(exception + restart)"]
         FATAL["fatal_error\n(error)"]
+        UNHANDLED["unhandled_task_error\n(task_name)"]
     end
 
     %% Связи ошибок
@@ -229,6 +383,8 @@ flowchart TB
     style FATAL fill:#f44,stroke:#333,color:#fff
     style HANDLER_FAILED fill:#f99,stroke:#333
     style TIMEOUT_LOG fill:#ff9,stroke:#333
+    style EXPIRED fill:#f99,stroke:#f44
+    style UNHANDLED fill:#f99,stroke:#333
 ```
 
 ---
@@ -238,9 +394,17 @@ flowchart TB
 Ключевое архитектурное решение: **`delivery_response` логируется ДО `raise_for_status`**.
 
 ```python
-# delivery.py:121-134
-logger.info("delivery_response", ...)  # - первым
-resp.raise_for_status()                # - вторым
+# delivery.py:164-176
+DeliveryResponseEvent(
+    schedule_id=schedule_id,
+    destination=destination,
+    url=url,
+    status_code=resp.status_code,
+    response_headers=dict(resp.headers),
+    response_body=resp_body,
+    duration_ms=duration_ms,
+).emit()         # - первым
+resp.raise_for_status()  # - вторым
 ```
 
 **Причина:** при HTTP-статусе 4xx/5xx `raise_for_status` бросает исключение,
@@ -282,11 +446,19 @@ def _add_context_vars(logger, method_name, event_dict):
 Каждая строка -- валидный JSON. Примеры:
 
 ```json
-{"event": "service_startup", "level": "info", "logger": "lifespan", "timestamp": "2025-06-26T10:00:00"}
-{"event": "payload_received", "level": "info", "logger": "lifespan", "message_id": "a1b2c3d4", "destination": "destination1", "url": "http://example.com/hook", "timeout": 30, "pause": 5, "ttl": 300, "trace_id": "my-trace-001", "schedule_id": "delivery_destination1_e5f6g7h8", "timestamp": "2025-06-26T10:00:01"}
-{"event": "delivery_scheduled", "level": "info", "logger": "delivery", "message_id": "a1b2c3d4", "schedule_id": "delivery_destination1_e5f6g7h8", "destination": "destination1", "url": "http://example.com/hook", "pause": 5, "ttl": 300, "trace_id": "my-trace-001", "end_time": "2025-06-26T10:05:01+00:00", "timestamp": "2025-06-26T10:00:01"}
-{"event": "delivery_attempt", "level": "info", "logger": "delivery", "message_id": "a1b2c3d4", "trace_id": "my-trace-001", "schedule_id": "delivery_destination1_e5f6g7h8", "destination": "destination1", "url": "http://example.com/hook", "body_size": 42, "timeout": 30, "timestamp": "2025-06-26T10:00:01"}
-{"event": "delivery_success", "level": "info", "logger": "delivery", "message_id": "a1b2c3d4", "trace_id": "my-trace-001", "schedule_id": "delivery_destination1_e5f6g7h8", "destination": "destination1", "url": "http://example.com/hook", "status_code": 200, "duration_ms": 150, "timestamp": "2025-06-26T10:00:01"}
+{"event": "delivery_attempt", "dt": "2025-06-26T10:00:01Z", "ulid": "01J...", "level": "info", "timestamp": "2025-06-26T10:00:01Z", "message_id": "a1b2c3d4", "trace_id": "my-trace-001", "schedule_id": "delivery_destination1_e5f6g7h8", "destination": "destination1", "url": "http://example.com/hook", "body_size": 42, "timeout": 30}
+```
+
+Событие от stdlib-логгера (через ``foreign_pre_chain``):
+
+```json
+{"event": "Uvicorn running on 0.0.0.0:8000", "level": "info", "logger": "uvicorn", "timestamp": "2025-06-26T10:00:00Z"}
+```
+
+Событие от stderr redirect (Rust tracing pyesb-amqp / ``_jsonl_line()``):
+
+```json
+{"event": "pyesb_amqp v0.0.1 starting \u2014 host=0.0.0.0, port=6698", "level": "info", "logger": "pyesb_amqp", "dt": "2025-06-26T10:00:00Z", "ulid": "01J...", "timestamp": "2025-06-26T10:00:00Z"}
 ```
 
 Стандартные поля, добавляемые каждым событием:
@@ -294,10 +466,27 @@ def _add_context_vars(logger, method_name, event_dict):
 - `level` -- уровень: `info`, `warning`, `error`, `exception`, `debug`
 - `logger` -- имя логера (`lifespan`, `delivery`, `http`, `stderr_redirect`)
 - `timestamp` -- ISO-8601 метка времени
+- `dt` -- ISO-8601 метка времени (всегда, у всех событий)
+- `ulid` -- уникальный 26-символьный ULID события (всегда, у всех событий)
 - `message_id` -- (через contextvars, если доступен)
 - `trace_id` -- (через contextvars, если доступен)
 
-Для uvicorn/stdlib-сообщений без structlog формат оборачивается в `JsonlFormatter`:
+| Поле | Тип | Описание | Источник |
+|------|-----|----------|----------|
+| `dt` | `string` | ISO-8601 метка времени (от Pydantic, всегда есть у event-моделей) | `LogEvent.dt` (default_factory) |
+| `ulid` | `string` | Уникальный 26-символьный ULID события | `LogEvent.ulid` (default_factory) |
+| `event` | `string` | Имя события | `_event_name` ClassVar на модели |
+| `level` | `string` | `info`, `warning`, `error`, `exception`, `debug` | `_level` ClassVar либо `add_log_level` processor |
+| `timestamp` | `string` | ISO-8601 метка времени (от structlog) | `TimeStamper` processor |
+| `logger` | `string` | Имя логера (только для stdlib/foreign_pre_chain) | `add_logger_name` processor |
+| `message_id` | `string` | UUIDv4 идентификатор сообщения (через contextvars) | `delivery.message_id_var` |
+| `trace_id` | `string` | UUID сквозной трассировки (через contextvars) | `app.context.trace_id_var` |
+
+Поля событий -- в таблицах выше (колонка "Поля").
+
+---
+
+Для uvicorn/stdlib-сообщений без structlog формат обрабатывается через `ProcessorFormatter.foreign_pre_chain`:
 
 ```json
 {"event": "Uvicorn running on http://0.0.0.0:8000", "level": "info", "logger": "uvicorn", "module": "server", "line": 42, "timestamp": "2025-06-26T10:00:00"}
@@ -305,18 +494,7 @@ def _add_context_vars(logger, method_name, event_dict):
 
 ---
 
-## Стандартные поля JSONL
-
-| Поле | Тип | Описание | Источник |
-|------|-----|----------|----------|
-| `event` | `string` | Имя события | Код приложения |
-| `level` | `string` | `info`, `warning`, `error`, `exception`, `debug` | structlog.stdlib.add_log_level |
-| `logger` | `string` | Имя логера (модуль) | structlog.stdlib.LoggerFactory |
-| `timestamp` | `string` | ISO-8601 | structlog.processors.TimeStamper |
-| `message_id` | `string` | UUIDv4 идентификатор сообщения | `delivery.message_id_var` (contextvars) |
-| `trace_id` | `string` | UUID сквозной трассировки — из тела сообщения (поле `trace_id`), либо из заголовка `X-Trace-Id`. См. `_resolve_trace_id()` в `main.py` | `app.context.trace_id_var` (contextvars) |
-
-Поля событий -- в таблицах выше (колонка "Поля").
+Для учёта изменений в ходе рефакторинга секция "Стандартные поля JSONL" перенесена выше в блок "Формат JSONL".
 
 ---
 
@@ -346,7 +524,7 @@ grep '"trace_id":"<uuid>"' logs/*.jsonl | jq '.timestamp + " " + .event'
 1. Поле `trace_id` в JSON-теле сообщения (``PayloadSchema.trace_id``) — приоритет.
 2. Заголовок ``X-Trace-Id`` в AMQP-сообщении (секция ``headers``) — fallback.
 
-Извлечение выполняется в ``main.py:_resolve_trace_id()`` для обоих каналов (AMQP / HTTP).
+Извлечение выполняется в ``router.py:resolve_trace_id()`` для обоих каналов (AMQP / HTTP).
 
 ---
 

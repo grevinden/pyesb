@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from .config import settings
+
 _engine: AsyncEngine | None = None
-_DATABASE_URL: str = "sqlite+aiosqlite:///data.db"
 
 
 def get_engine(db_url: str | None = None) -> AsyncEngine:
@@ -13,7 +14,7 @@ def get_engine(db_url: str | None = None) -> AsyncEngine:
     global _engine
     if _engine is None:
         _engine = create_async_engine(
-            db_url or _DATABASE_URL,
+            db_url or settings.DATABASE_URL,
             echo=False,
         )
     return _engine

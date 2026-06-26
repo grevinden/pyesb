@@ -235,7 +235,12 @@ class PayloadReceivedEvent(MessageRef, TargetRef, ScheduleRef):
 
 
 class PayloadReceivedAMQPEvent(PayloadReceivedEvent):
-    """Сообщение получено из AMQP (с дополнительными полями аудита 1С)."""
+    """Сообщение получено из AMQP (с дополнительными полями аудита 1С).
+
+    ``delivery_count`` — сколько раз AMQP-брокер уже выдавал это сообщение
+    (поле ``Header.delivery_count``). Позволяет детектить повторные
+    доставки со стороны брокера (не путать с retry-циклом pyesb).
+    """
 
     _event_name: ClassVar[str] = "payload_received"
     _level: ClassVar[str] = "info"
@@ -243,6 +248,7 @@ class PayloadReceivedAMQPEvent(PayloadReceivedEvent):
     sender_code: str | None = None
     recipient_code: str | None = None
     integ_message_id: str
+    delivery_count: int
 
 
 # ── Handler / Errors ──────────────────────────────────────────────────
@@ -351,6 +357,35 @@ class FatalErrorEvent(LogEvent):
     _event_name: ClassVar[str] = "fatal_error"
     _level: ClassVar[str] = "exception"
     error: str
+
+
+class UnhandledTaskErrorEvent(LogEvent):
+    """Необработанная ошибка в фоновой asyncio-задаче (safe_create_task).
+
+    Срабатывает при любом исключении, кроме ``CancelledError``,
+    в обёртке ``safe_create_task._wrapped()``.
+    """
+
+    _event_name: ClassVar[str] = "unhandled_task_error"
+    _level: ClassVar[str] = "exception"
+    task_name: str | None = None
+
+
+class DeliveryExpiredEvent(ScheduleRef, TargetRef, MessageRef):
+    """Доставка окончательно провалена — исчерпан TTL.
+
+    Все retry-попытки по IntervalTrigger закончились,
+    целевой сервер так и не ответил 2xx.
+    Это аналог Dead Letter Queue (DLQ) — сообщение требует
+    ручного анализа.
+    """
+
+    _event_name: ClassVar[str] = "delivery_expired"
+    _level: ClassVar[str] = "warning"
+    pause: int
+    ttl: int
+    error: str | None = None
+    attempts: int | None = None
 
 
 # ===================================================================

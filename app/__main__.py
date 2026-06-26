@@ -11,14 +11,13 @@ import asyncio
 import multiprocessing as _mp
 import sys
 
-import structlog
 import uvicorn
 from aiorun import run
 from uvicorn.main import STARTUP_FAILURE
 
+from app.config import settings
+from app.events import FatalErrorEvent
 from app.main import app
-
-logger = structlog.get_logger("pyesb.__main__")
 
 _server_ref: list[uvicorn.Server] = []
 
@@ -35,8 +34,8 @@ async def _async_main() -> None:
     try:
         config = uvicorn.Config(
             app,
-            host="0.0.0.0",
-            port=8000,
+            host=settings.BIND_HOST,
+            port=settings.BIND_PORT,
             workers=1,
             reload=False,
         )
@@ -59,7 +58,7 @@ def main() -> None:
     try:
         run(_async_main(), stop_on_unhandled_errors=True)
     except BaseException as exc:
-        logger.exception("fatal_error", error=f"{type(exc).__name__}: {exc}")
+        FatalErrorEvent(error=f"{type(exc).__name__}: {exc}").emit()
         sys.exit(STARTUP_FAILURE)
 
     if _server_ref and not _server_ref[0].started:

@@ -17,6 +17,7 @@ from aiorun import shutdown_waits_for
 from apscheduler import CoalescePolicy, current_async_scheduler, current_job
 from apscheduler.triggers.interval import IntervalTrigger
 
+from .config import settings
 from .context import message_id_var, trace_id_var
 from .events import (
     DeliveryAttemptEvent,
@@ -34,6 +35,21 @@ from .events import (
     fmt_headers,
 )
 
+# ── Concurrency control ───────────────────────────────────────────────
+# Семафор ограничивает количество одновременно выполняемых HTTP-запросов.
+# Предотвращает исчерпание соединений (DB, внешние API, сокеты)
+# при всплеске нагрузки.
+_delivery_semaphore: asyncio.Semaphore = asyncio.Semaphore(
+    settings.MAX_CONCURRENT_DELIVERIES
+)
+"""Maximum concurrent HTTP deliveries (across all destinations).
+
+Выбирается исходя из:
+* лимитов целевых серверов (concurrent connections per host),
+* доступных файловых дескрипторов (ulimit -n),
+* размера пула соединений ``httpx``.
+"""
+
 # ── Shutdown guard ───────────────────────────────────────────────────
 # Множество asyncio.Task-ов, которые сейчас выполняют HTTP-запрос.
 # Используется в lifespan для ожидания завершения доставок.
@@ -42,6 +58,14 @@ _in_flight: set[asyncio.Task] = set()
 # Флаг: приложение выключается. Новые вызовы deliver_payload
 # не выполняют HTTP-запрос, а сразу возвращаются (no-op).
 _shutting_down: bool = False
+
+# ── DLQ tracking ────────────────────────────────────────────────────────
+# Храним end_time для каждого schedule_id.
+# Когда retry исчерпаны, а HTTP всё ещё не 2xx — ``DeliveryExpiredEvent``.
+_schedule_end_times: dict[str, datetime] = {}
+
+# Счётчик попыток на schedule (сбрасывается при перезапуске).
+_attempt_counts: dict[str, int] = {}
 
 
 _MAX_BODY_CHARS: int = 4096
@@ -95,6 +119,10 @@ async def deliver_payload(
     current_task = asyncio.current_task()
     assert current_task is not None, "deliver_payload must run inside an asyncio task"
     _in_flight.add(current_task)
+
+    # Увеличиваем счётчик попыток для DLQ
+    _attempt_counts[schedule_id] = _attempt_counts.get(schedule_id, 0) + 1
+
     try:
         # ── delivery_attempt ──────────────────────────────────────────
         DeliveryAttemptEvent(
@@ -106,6 +134,16 @@ async def deliver_payload(
             body=body_repr,
             timeout=timeout,
         ).emit()
+
+        # ── Concurrency guard (Semaphore) ──────────────────────────────
+        # Ограничиваем количество одновременно выполняемых HTTP-запросов.
+        # Если все ``_delivery_semaphore`` заняты — ожидаем освобождения.
+        # Это предотвращает исчерпание соединений и перегрузку целевых
+        # серверов при всплеске нагрузки.
+        semaphore_acquired: bool = False
+        if not _shutting_down:
+            await _delivery_semaphore.acquire()
+            semaphore_acquired = True
 
         # ── HTTP POST (защищённый от отмены) ──────────────────────────
         t0 = datetime.now(timezone.utc)
@@ -147,6 +185,13 @@ async def deliver_payload(
                 status_code=exc.response.status_code,
                 error=_short_exc(exc),
             ).emit()
+            _check_permanent_failure(
+                schedule_id,
+                message_id,
+                destination,
+                url,
+                trace_id,
+            )
             return  # APScheduler повторит по IntervalTrigger
 
         except Exception as exc:
@@ -158,6 +203,13 @@ async def deliver_payload(
                 error=_short_exc(exc),
                 duration_ms=duration_ms,
             ).emit()
+            _check_permanent_failure(
+                schedule_id,
+                message_id,
+                destination,
+                url,
+                trace_id,
+            )
             return  # APScheduler повторит по IntervalTrigger
 
         # ── delivery_success ──────────────────────────────────────────
@@ -180,6 +232,8 @@ async def deliver_payload(
 
     finally:
         _in_flight.discard(current_task)
+        if semaphore_acquired:
+            _delivery_semaphore.release()
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +241,9 @@ async def deliver_payload(
 # ---------------------------------------------------------------------------
 
 
-async def wait_for_in_flight(timeout: float = 30) -> None:
+async def wait_for_in_flight(timeout: float | None = None) -> None:
+    if timeout is None:
+        timeout = float(settings.SHUTDOWN_TIMEOUT)
     """Дождаться завершения всех in-flight доставок.
 
     Вызывается из shutdown-последовательности **до** того как
@@ -239,6 +295,9 @@ async def create_delivery_schedule(
     now = datetime.now(timezone.utc)
     end = now + timedelta(seconds=ttl)
 
+    # Сохраняем end_time для DLQ-детекции
+    _schedule_end_times[schedule_id] = end
+
     await scheduler.add_schedule(  # type: ignore[union-attr]
         deliver_payload,
         IntervalTrigger(
@@ -269,6 +328,40 @@ async def create_delivery_schedule(
 # ---------------------------------------------------------------------------
 # Хелперы
 # ---------------------------------------------------------------------------
+
+
+def _check_permanent_failure(
+    schedule_id: str,
+    message_id: str,
+    destination: str,
+    url: str,
+    trace_id: str | None,
+) -> None:
+    """Проверить, исчерпан ли TTL. Если да — ``DeliveryExpiredEvent``.
+
+    Вызывается из error-handler'ов ``deliver_payload`` перед ``return``.
+    Если ``end_time`` в прошлом, а HTTP всё ещё не 2xx — это permanent
+    failure (аналог DLQ).
+    """
+    from .events import DeliveryExpiredEvent
+
+    end_time = _schedule_end_times.get(schedule_id)
+    if end_time is None:
+        return
+    if datetime.now(timezone.utc) < end_time:
+        return  # ещё есть попытки
+
+    attempts = _attempt_counts.get(schedule_id, 0)
+    DeliveryExpiredEvent(
+        schedule_id=schedule_id,
+        destination=destination,
+        url=url,
+        message_id=message_id,
+        trace_id=trace_id,
+        pause=0,
+        ttl=0,
+        attempts=attempts,
+    ).emit()
 
 
 def _short_exc(exc: Exception) -> str:
